@@ -9,28 +9,110 @@ MAX_JOBS=$(nproc)
 check_dependencies() {
     local pkgs=("ffmpeg" "cpulimit")
     local missing_pkgs=()
+    local ID=""
+    local ID_LIKE=""
+    local OS_ID=""
+    local OS_LIKE=""
+    local OS_FAMILY=""
+    local pkg
+    local response
 
+    # Detect OS and OS Family using /etc/os-release
     if [ -f /etc/os-release ]; then
         . /etc/os-release
-        OS=$ID
+        OS_ID=$ID
+        OS_LIKE=$ID_LIKE
     else
-        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        OS_ID=$(uname -s | tr '[:upper:]' '[:lower:]')
+        OS_LIKE=""
     fi
 
-    echo "[i] Detected OS: $OS"
+    # Normalize OS Family
+    case "$OS_ID" in
+        ubuntu|debian|mint|pop|elementary|neon|devuan)
+            OS_FAMILY="debian"
+            ;;
+        fedora|rhel|centos|rocky|almalinux|amzn|ol)
+            OS_FAMILY="redhat"
+            ;;
+        opensuse*|sles)
+            OS_FAMILY="suse"
+            ;;
+        arch|manjaro|endeavouros|artix)
+            OS_FAMILY="arch"
+            ;;
+        alpine)
+            OS_FAMILY="alpine"
+            ;;
+    esac
+
+    # If OS_FAMILY is not set, try OS_LIKE
+    if [ -z "$OS_FAMILY" ] && [ -n "$OS_LIKE" ]; then
+        for like in $OS_LIKE; do
+            case "$like" in
+                ubuntu|debian)
+                    OS_FAMILY="debian"
+                    break
+                    ;;
+                fedora|rhel|centos)
+                    OS_FAMILY="redhat"
+                    break
+                    ;;
+                suse|opensuse)
+                    OS_FAMILY="suse"
+                    break
+                    ;;
+                arch)
+                    OS_FAMILY="arch"
+                    break
+                    ;;
+                alpine)
+                    OS_FAMILY="alpine"
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    echo "[i] Detected OS: $OS_ID (Family: ${OS_FAMILY:-unknown})"
 
     for pkg in "${pkgs[@]}"; do
-        case "$OS" in
-            ubuntu|debian)
-                if ! dpkg -l | grep -q "^ii  $pkg "; then missing_pkgs+=("$pkg"); fi
+        # 1. First, check if the executable is already available in PATH
+        if command -v "$pkg" >/dev/null 2>&1; then
+            continue
+        fi
+
+        # 2. If not in PATH, check if package is installed in system package manager
+        local is_installed=false
+        case "$OS_FAMILY" in
+            debian)
+                if dpkg -s "$pkg" >/dev/null 2>&1; then
+                    is_installed=true
+                fi
                 ;;
-            fedora|rhel|centos)
-                if ! rpm -q "$pkg" > /dev/null 2>&1; then missing_pkgs+=("$pkg"); fi
+            redhat|suse)
+                if rpm -q "$pkg" >/dev/null 2>&1; then
+                    is_installed=true
+                fi
                 ;;
-            *)
-                if ! command -v "$pkg" > /dev/null 2>&1; then missing_pkgs+=("$pkg"); fi
+            arch)
+                if pacman -Qi "$pkg" >/dev/null 2>&1; then
+                    is_installed=true
+                fi
+                ;;
+            alpine)
+                if apk info -e "$pkg" >/dev/null 2>&1; then
+                    is_installed=true
+                fi
                 ;;
         esac
+
+        if [ "$is_installed" = true ]; then
+            echo "[!] Warning: Package '$pkg' is installed, but command '$pkg' is not in PATH."
+            echo "    Please verify your PATH environment variable."
+        else
+            missing_pkgs+=("$pkg")
+        fi
     done
 
     if [ ${#missing_pkgs[@]} -gt 0 ]; then
@@ -38,11 +120,51 @@ check_dependencies() {
         echo "[?] Would you like to install them? (requires sudo) [y/N]"
         read -r response
         if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-            case "$OS" in
-                ubuntu|debian) sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}" ;;
-                fedora) sudo dnf install -y "${missing_pkgs[@]}" ;;
-                rhel|centos) sudo yum install -y "${missing_pkgs[@]}" ;;
-                *) echo "[!] Unknown OS. Please install manually."; exit 1 ;;
+            case "$OS_FAMILY" in
+                debian)
+                    sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}"
+                    ;;
+                redhat)
+                    local pm="yum"
+                    if command -v dnf >/dev/null 2>&1; then
+                        pm="dnf"
+                    fi
+                    if ! sudo $pm install -y "${missing_pkgs[@]}"; then
+                        echo "[!] Installation failed."
+                        if [[ " ${missing_pkgs[*]} " =~ " ffmpeg " ]]; then
+                            echo "[i] Note: 'ffmpeg' on RHEL/CentOS/Rocky Linux requires EPEL and RPM Fusion repositories."
+                            echo "    You can enable them by running:"
+                            echo "    sudo dnf install -y epel-release"
+                            echo "    sudo dnf config-manager --set-enabled crb"
+                            echo "    sudo dnf install -y https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-\$(rpm -E %rhel).noarch.rpm"
+                        fi
+                        exit 1
+                    fi
+                    ;;
+                suse)
+                    sudo zypper install -y "${missing_pkgs[@]}"
+                    ;;
+                arch)
+                    sudo pacman -Sy --noconfirm "${missing_pkgs[@]}"
+                    ;;
+                alpine)
+                    sudo apk add "${missing_pkgs[@]}"
+                    ;;
+                *)
+                    # Fallback if OS family detection was inconclusive
+                    if command -v apt-get >/dev/null 2>&1; then
+                        sudo apt-get update && sudo apt-get install -y "${missing_pkgs[@]}"
+                    elif command -v dnf >/dev/null 2>&1; then
+                        sudo dnf install -y "${missing_pkgs[@]}"
+                    elif command -v yum >/dev/null 2>&1; then
+                        sudo yum install -y "${missing_pkgs[@]}"
+                    elif command -v pacman >/dev/null 2>&1; then
+                        sudo pacman -Sy --noconfirm "${missing_pkgs[@]}"
+                    else
+                        echo "[!] Unknown package manager. Please install manually: ${missing_pkgs[*]}"
+                        exit 1
+                    fi
+                    ;;
             esac
         else
             echo "[!] Cannot proceed without dependencies."; exit 1
