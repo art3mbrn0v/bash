@@ -71,11 +71,43 @@ else
     echo "Minikube directory not found."
 fi
 
-if [[ -d "$HOME/.ssh" ]]; then
-    chmod 700 "$HOME/.ssh" 2>/dev/null
-    find "$HOME/.ssh" -type f -exec chmod 600 {} + 2>/dev/null
-    echo -e "${GREEN}✓ SSH directory permissions secured (700 for .ssh, 600 for keys).${NC}"
-fi
+echo -e "\n${YELLOW}--- Auditing SSH Private Keys & Passphrase Protection (All Users) ---${NC}"
+check_ssh_keys_passphrase() {
+    local unencrypted_keys_found=0
+    local total_keys_found=0
+
+    while IFS=: read -r username password uid gid gecos home shell; do
+        local ssh_dir="$home/.ssh"
+        if [[ -d "$ssh_dir" ]]; then
+            chmod 700 "$ssh_dir" 2>/dev/null
+            
+            while read -r key_file; do
+                [[ -f "$key_file" ]] || continue
+                
+                if grep -q "PRIVATE KEY" "$key_file" 2>/dev/null; then
+                    chmod 600 "$key_file" 2>/dev/null
+                    ((total_keys_found++))
+                    
+                    if ssh-keygen -y -P "" -f "$key_file" &>/dev/null; then
+                        ((unencrypted_keys_found++))
+                        echo -e "  - ${RED}⚠️ UNPROTECTED SSH KEY:${NC} User ${CYAN}${username}${NC} -> ${key_file} (${RED}No passphrase set!${NC})"
+                    else
+                        echo -e "  - ${GREEN}✓ Protected SSH Key:${NC} User ${CYAN}${username}${NC} -> $(basename "$key_file")"
+                    fi
+                fi
+            done < <(find "$ssh_dir" -maxdepth 2 -type f ! -name "*.pub" ! -name "known_hosts*" ! -name "authorized_keys*" ! -name "config" 2>/dev/null)
+        fi
+    done < /etc/passwd
+
+    if [[ "$total_keys_found" -eq 0 ]]; then
+        echo -e "${GREEN}✓ No SSH private keys found on the system.${NC}"
+    elif [[ "$unencrypted_keys_found" -eq 0 ]]; then
+        echo -e "${GREEN}✓ All discovered SSH private keys (${total_keys_found}) are protected with passphrases.${NC}"
+    else
+        echo -e "${RED}⚠️ Found ${unencrypted_keys_found} SSH private key(s) without a passphrase! Setting a passphrase is recommended for security.${NC}"
+    fi
+}
+check_ssh_keys_passphrase
 
 # 3. Application CVE Checks
 section "3/11" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
@@ -244,13 +276,30 @@ parse_security_logs
 
 # 9. System Optimization & Resource Audit
 section "9/11" "Checking System Resources & Optimization Opportunities..."
-echo -e "${YELLOW}--- Disk Space Usage ---${NC}"
-df -h --total -x tmpfs -x devtmpfs | grep -E 'Filesystem|total|/[a-z]*$'
+echo -e "${YELLOW}--- Disk Space Usage & Free Space Check ---${NC}"
+df -h -x tmpfs -x devtmpfs -x squashfs
 
-# Warn on high disk usage (>85%)
-HIGH_DISK=$(df -h | awk '0+$5 > 85 {print $5 " occupied on " $6}')
-if [[ -n "$HIGH_DISK" ]]; then
-    echo -e "${RED}⚠️ High disk usage detected:${NC}\n$HIGH_DISK"
+HIGH_DISK_ALERT=""
+while read -r line; do
+    fs=$(echo "$line" | awk '{print $1}')
+    size=$(echo "$line" | awk '{print $2}')
+    used=$(echo "$line" | awk '{print $3}')
+    avail=$(echo "$line" | awk '{print $4}')
+    use_pct_str=$(echo "$line" | awk '{print $5}')
+    mount=$(echo "$line" | awk '{print $6}')
+
+    use_pct=${use_pct_str%\%}
+
+    if [[ "$use_pct" =~ ^[0-9]+$ ]] && [[ "$use_pct" -ge 80 ]]; then
+        HIGH_DISK_ALERT+="$(echo -e "  - ${RED}WARNING! Partition ${mount} (${fs}) is ${use_pct}% full!${NC} (Free space: ${GREEN}${avail}${NC} available out of ${size}, Used: ${used})")\n"
+    fi
+done < <(df -h -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | awk 'NR>1')
+
+if [[ -n "$HIGH_DISK_ALERT" ]]; then
+    echo -e "\n${RED}⚠️ High disk usage detected (>= 80% occupied):${NC}"
+    echo -e "$HIGH_DISK_ALERT"
+else
+    echo -e "\n${GREEN}✓ All disk partitions have sufficient free space (< 80% used).${NC}"
 fi
 
 echo -e "\n${YELLOW}--- Systemd Failed Services ---${NC}"
@@ -287,6 +336,43 @@ if [[ -n "$UID_ZERO" ]]; then
 else
     echo -e "${GREEN}✓ Only root user has UID 0.${NC}"
 fi
+
+echo -e "\n${YELLOW}--- Accounts with Console / Interactive Shell Access ---${NC}"
+check_console_users() {
+    while IFS=: read -r username password uid gid gecos home shell; do
+        if [[ "$shell" =~ (nologin|false|sync|halt|shutdown|null)$ ]]; then
+            continue
+        fi
+
+        local is_sudo="No"
+        if [[ "$uid" -eq 0 ]]; then
+            is_sudo="${RED}YES (ROOT)${NC}"
+        elif id -nG "$username" 2>/dev/null | grep -E -q '\b(sudo|wheel|admin)\b'; then
+            is_sudo="${YELLOW}YES (Sudo Group)${NC}"
+        fi
+
+        local pass_status="Unknown"
+        if command -v passwd &>/dev/null; then
+            local p_info
+            p_info=$(sudo passwd -S "$username" 2>/dev/null | awk '{print $2}')
+            case "$p_info" in
+                L|LK) pass_status="${YELLOW}Locked${NC}" ;;
+                P|PS) pass_status="${GREEN}Password Set${NC}" ;;
+                NP)   pass_status="${RED}NO PASSWORD!${NC}" ;;
+                *)    pass_status="Active" ;;
+            esac
+        fi
+
+        echo -e "  - ${CYAN}${username}${NC} (UID: ${uid}, Shell: ${shell})"
+        echo -e "    Home: ${home} | Sudo Privileges: ${is_sudo} | Password Status: ${pass_status}"
+
+        if [[ "$p_info" == "NP" ]]; then
+            echo -e "    ${RED}⚠️ SECURITY ALERT: User '${username}' has NO password set!${NC}"
+        fi
+
+    done < /etc/passwd
+}
+check_console_users
 
 # 11. Repository Kernel & Security Package Updates Audit
 section "11/11" "Auditing Repository Kernel Updates & Recommended Security Packages..."
