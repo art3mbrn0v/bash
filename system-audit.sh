@@ -111,7 +111,7 @@ update_security_databases() {
 update_security_databases
 
 # 1. Shell History Scanning & Cleaning
-section "1/19" "Cleaning Shell History for Sensitive Data..."
+section "1/20" "Cleaning Shell History for Sensitive Data..."
 clean_history() {
     local file="$1"
     if [[ -f "$file" ]]; then
@@ -132,7 +132,7 @@ done
 echo -e "${GREEN}✓ History cleaned and permissions set to 600.${NC}"
 
 # 2. Certificate & File Permission Checks
-section "2/19" "Checking Minikube & SSH Certificate Permissions..."
+section "2/20" "Checking Minikube & SSH Certificate Permissions..."
 MINIKUBE_DIR="$HOME/.minikube"
 if [[ -d "$MINIKUBE_DIR" ]]; then
     CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
@@ -188,7 +188,7 @@ check_ssh_keys_passphrase() {
 check_ssh_keys_passphrase
 
 # 3. Application CVE Checks
-section "3/19" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
+section "3/20" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
 if command -v dnf &> /dev/null; then
     for app in "${APPS_TO_CHECK[@]}"; do
@@ -208,7 +208,7 @@ else
 fi
 
 # 4. SSH Configuration Audit
-section "4/19" "Auditing SSH Daemon Configuration..."
+section "4/20" "Auditing SSH Daemon Configuration..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
     ROOT_LOGIN=$(sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
@@ -231,7 +231,7 @@ else
 fi
 
 # 5. Network & Open Ports Audit
-section "5/19" "Checking Active Listening Ports & Firewall Status..."
+section "5/20" "Checking Active Listening Ports & Firewall Status..."
 if command -v systemctl &> /dev/null; then
     if systemctl is-active --quiet firewalld; then
         echo -e "${GREEN}✓ firewalld is active.${NC}"
@@ -259,7 +259,7 @@ if command -v ss &> /dev/null; then
 fi
 
 # 6. Antivirus & Security Daemon Checks (ClamAV & rkhunter)
-section "6/19" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
+section "6/20" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
 if command -v systemctl &> /dev/null && systemctl is-active --quiet clamav-freshclam; then
     echo -e "${GREEN}✓ clamav-freshclam service is active and managing database updates automatically.${NC}"
 elif command -v freshclam &> /dev/null; then
@@ -283,7 +283,7 @@ else
 fi
 
 # 7. Filesystem & Container Security Scanning (Trivy)
-section "7/19" "Trivy Code & Filesystem Security Scan..."
+section "7/20" "Trivy Code & Filesystem Security Scan..."
 if command -v trivy &> /dev/null; then
     trivy fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory"
 else
@@ -291,7 +291,7 @@ else
 fi
 
 # 8. System Log & Auth Audit
-section "8/19" "Analyzing System Logs & Parsing Suspicious Security Entries..."
+section "8/20" "Analyzing System Logs & Parsing Suspicious Security Entries..."
 
 parse_security_logs() {
     local pattern_regex="Failed password|Invalid user|authentication failure|NOT in sudoers|maximum authentication attempts|segfault|Out of memory: Kill process|denied"
@@ -353,7 +353,7 @@ parse_security_logs() {
 parse_security_logs
 
 # 9. System Optimization & Resource Audit
-section "9/19" "Checking System Resources & Optimization Opportunities..."
+section "9/20" "Checking System Resources & Optimization Opportunities..."
 echo -e "${YELLOW}--- Disk Space Usage & Free Space Check ---${NC}"
 df -h -x tmpfs -x devtmpfs -x squashfs
 
@@ -406,7 +406,7 @@ if command -v dnf &> /dev/null; then
 fi
 
 # 10. Privilege & Account Audit
-section "10/19" "Privilege & Security Misconfiguration Audit..."
+section "10/20" "Privilege & Security Misconfiguration Audit..."
 echo -e "${YELLOW}--- Checking for Non-Root Accounts with UID 0 ---${NC}"
 UID_ZERO=$(awk -F: '($3 == "0" && $1 != "root") { print $1 }' /etc/passwd)
 if [[ -n "$UID_ZERO" ]]; then
@@ -453,7 +453,7 @@ check_console_users() {
 check_console_users
 
 # 11. Repository Kernel & Security Package Updates Audit
-section "11/19" "Auditing Repository Kernel Updates & Recommended Security Packages..."
+section "11/20" "Auditing Repository Kernel Updates & Recommended Security Packages..."
 RUNNING_KERNEL=$(uname -r)
 echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
 
@@ -534,7 +534,7 @@ else
 fi
 
 # 12. Suspicious Process & Threat Detection Audit
-section "12/19" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
+section "12/20" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
 
 audit_suspicious_processes() {
     local threats_found=0
@@ -626,7 +626,7 @@ audit_suspicious_processes() {
 audit_suspicious_processes
 
 # 13. Shell Configuration & Security Alias Audit
-section "13/19" "Auditing Shell Config Files (.bashrc, .zshrc) & Security Aliases (All Users)..."
+section "13/20" "Auditing Shell Config Files (.bashrc, .zshrc) & Security Aliases (All Users)..."
 
 audit_shell_configs_and_aliases() {
     local target_rc_files=(".bashrc" ".zshrc" ".profile" ".bash_profile" ".zprofile" ".bash_aliases" ".zsh_aliases")
@@ -710,7 +710,7 @@ audit_shell_configs_and_aliases() {
 audit_shell_configs_and_aliases
 
 # 14. SUID / SGID Executable File Audit
-section "14/19" "Auditing SUID / SGID Files for Privilege Escalation Risk..."
+section "14/20" "Auditing SUID / SGID Files for Privilege Escalation Risk..."
 audit_suid_files() {
     echo -e "${YELLOW}--- Scanning for SUID/SGID Binaries in Volatile / Non-Standard Paths ---${NC}"
     local suspicious_suid
@@ -730,7 +730,7 @@ audit_suid_files() {
 audit_suid_files
 
 # 15. Persistence Audit (Cron Jobs & Systemd Timers)
-section "15/19" "Auditing System Persistence (Cron Jobs & Systemd Timers)..."
+section "15/20" "Auditing System Persistence (Cron Jobs & Systemd Timers)..."
 audit_persistence() {
     echo -e "${YELLOW}--- User Cron Jobs Audit ---${NC}"
     while IFS=: read -r username password uid gid gecos home shell; do
@@ -755,7 +755,7 @@ audit_persistence() {
 audit_persistence
 
 # 16. SSH authorized_keys Audit (All Users)
-section "16/19" "Auditing SSH Authorized Keys Across All Users..."
+section "16/20" "Auditing SSH Authorized Keys Across All Users..."
 audit_authorized_keys() {
     local keys_count=0
     while IFS=: read -r username password uid gid gecos home shell; do
@@ -780,7 +780,7 @@ audit_authorized_keys() {
 audit_authorized_keys
 
 # 17. Docker & Kubernetes Container Security Audit
-section "17/19" "Auditing Docker & Container Security Settings..."
+section "17/20" "Auditing Docker & Container Security Settings..."
 audit_container_security() {
     if [[ -S "/var/run/docker.sock" ]]; then
         local sock_perm
@@ -804,7 +804,7 @@ audit_container_security() {
 audit_container_security
 
 # 18. Kernel Security Hardening (Sysctl Parameters Audit)
-section "18/19" "Auditing Kernel Security Hardening (sysctl Parameters)..."
+section "18/20" "Auditing Kernel Security Hardening (sysctl Parameters)..."
 audit_kernel_hardening() {
     local SYSCTL_BIN="sysctl"
     command -v sysctl &>/dev/null || SYSCTL_BIN="/usr/sbin/sysctl"
@@ -830,7 +830,7 @@ audit_kernel_hardening() {
 audit_kernel_hardening
 
 # 19. Network DNS & /etc/hosts Integrity Audit
-section "19/19" "Auditing DNS Settings & /etc/hosts Integrity..."
+section "19/20" "Auditing DNS Settings & /etc/hosts Integrity..."
 audit_dns_hosts() {
     echo -e "${YELLOW}--- DNS Resolvers (/etc/resolv.conf) ---${NC}"
     if [[ -f "/etc/resolv.conf" ]]; then
@@ -850,6 +850,94 @@ audit_dns_hosts() {
     fi
 }
 audit_dns_hosts
+
+# 20. Wi-Fi Access Points, Security & Local Network Hosts Audit
+section "20/20" "Auditing Wi-Fi Networks, Connected AP Security & Local Network Hosts..."
+
+audit_wifi_and_network_hosts() {
+    echo -e "${YELLOW}--- 1. Primary Network Interface & Subnet Info ---${NC}"
+    local default_route
+    default_route=$(ip route show default 2>/dev/null | head -n 1)
+    local gw_ip=""
+    if [[ -n "$default_route" ]]; then
+        gw_ip=$(echo "$default_route" | awk '{print $3}')
+        local iface
+        iface=$(echo "$default_route" | awk '{print $5}')
+        local local_ip
+        local_ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}')
+        echo -e "Primary Interface: ${CYAN}${iface}${NC} | Local IP: ${CYAN}${local_ip}${NC} | Gateway: ${CYAN}${gw_ip}${NC}"
+    else
+        echo "No active default network gateway found."
+    fi
+
+    echo -e "\n${YELLOW}--- 2. Wi-Fi Networks & Connected Access Point Security ---${NC}"
+    if command -v nmcli &>/dev/null; then
+        local connected_wifi
+        connected_wifi=$(nmcli -f IN-USE,SSID,BSSID,RATE,SIGNAL,SECURITY dev wifi 2>/dev/null | grep '^\*')
+        if [[ -n "$connected_wifi" ]]; then
+            echo -e "${CYAN}Currently Connected Wi-Fi Network:${NC}"
+            echo "$connected_wifi"
+
+            local wifi_sec
+            wifi_sec=$(echo "$connected_wifi" | awk '{print $NF}')
+            echo -n "Connected Security Protocol Assessment: "
+            if [[ "$wifi_sec" =~ OPEN|NONE ]]; then
+                echo -e "${RED}⚠️ CRITICAL SECURITY RISK! Connected to an UNENCRYPTED (OPEN) Wi-Fi network! Traffic can be intercepted.${NC}"
+            elif [[ "$wifi_sec" =~ WEP|WPA1 ]]; then
+                echo -e "${RED}⚠️ WARNING! Connected to obsolete/vulnerable ${wifi_sec} network.${NC}"
+            elif [[ "$wifi_sec" =~ WPA3 ]]; then
+                echo -e "${GREEN}✓ WPA3 Security (Strongest modern encryption standard).${NC}"
+            elif [[ "$wifi_sec" =~ WPA2 ]]; then
+                echo -e "${GREEN}✓ WPA2 Security (Secure standard).${NC}"
+            else
+                echo -e "${CYAN}${wifi_sec}${NC}"
+            fi
+        else
+            echo "Not connected to any Wi-Fi access point."
+        fi
+
+        echo -e "\n${CYAN}Nearby Wi-Fi Access Points in Range:${NC}"
+        local wifi_list
+        wifi_list=$(nmcli -f SSID,BSSID,SIGNAL,SECURITY dev wifi 2>/dev/null | head -n 12)
+        if [[ -n "$wifi_list" ]]; then
+            echo "$wifi_list"
+            local open_nearby
+            open_nearby=$(echo "$wifi_list" | grep -Ei 'OPEN|NONE')
+            if [[ -n "$open_nearby" ]]; then
+                echo -e "${YELLOW}⚠️ Warning: Open/unencrypted Wi-Fi networks detected nearby!${NC}"
+            fi
+        else
+            echo "No nearby Wi-Fi networks found or Wi-Fi adapter disabled."
+        fi
+    elif command -v iwconfig &>/dev/null; then
+        iwconfig 2>/dev/null | grep -E 'ESSID|Access Point|Encryption'
+    else
+        echo -e "${YELLOW}nmcli / iwconfig not available for Wi-Fi scanning.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- 3. Local Subnet Active Hosts Discovery ---${NC}"
+    if [[ -n "$gw_ip" ]]; then
+        local subnet_prefix
+        subnet_prefix=$(echo "$gw_ip" | awk -F. '{print $1"."$2"."$3}')
+        local subnet_cidr="${subnet_prefix}.0/24"
+        
+        echo -e "Scanning local subnet (${CYAN}${subnet_cidr}${NC})..."
+        if command -v nmap &>/dev/null; then
+            local nmap_hosts
+            nmap_hosts=$(nmap -sn --host-timeout 3s "$subnet_cidr" 2>/dev/null | grep -E "Nmap scan report|Host is up")
+            if [[ -n "$nmap_hosts" ]]; then
+                echo "$nmap_hosts"
+                local host_count
+                host_count=$(echo "$nmap_hosts" | grep -c "Nmap scan report")
+                echo -e "${GREEN}Total active hosts discovered on local subnet: ${host_count}${NC}"
+            fi
+        else
+            echo -e "${CYAN}Active neighbors (ARP / IP Cache):${NC}"
+            ip neighbor show 2>/dev/null | grep -v 'FAILED' | sed 's/^/  - /'
+        fi
+    fi
+}
+audit_wifi_and_network_hosts
 
 echo -e "\n${CYAN}=====================================================${NC}"
 echo -e "${GREEN}=== Audit Completed Successfully! ===${NC}"
