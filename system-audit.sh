@@ -181,20 +181,66 @@ else
 fi
 
 # 8. System Log & Auth Audit
-section "8/11" "Analyzing System Logs for Suspicious Activity..."
-echo -e "${YELLOW}--- Failed Auth Attempts (Last 10) ---${NC}"
-if [[ -f "/var/log/secure" ]]; then
-    sudo grep -i "failed" /var/log/secure 2>/dev/null | tail -n 10 || echo "No failed attempts in /var/log/secure."
-else
-    sudo journalctl -u sshd -u gdm --grep="failed|invalid" -n 10 --no-pager 2>/dev/null || echo "No failed authentication entries in journal."
-fi
+section "8/11" "Analyzing System Logs & Parsing Suspicious Security Entries..."
 
-echo -e "${YELLOW}--- Recent Sudo Usage (Last 10) ---${NC}"
-if [[ -f "/var/log/secure" ]]; then
-    sudo grep "sudo" /var/log/secure 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/secure."
-else
-    sudo journalctl _COMM=sudo -n 10 --no-pager 2>/dev/null || echo "No sudo records found in journal."
-fi
+parse_security_logs() {
+    local pattern_regex="Failed password|Invalid user|authentication failure|NOT in sudoers|maximum authentication attempts|segfault|Out of memory: Kill process|denied"
+
+    echo -e "${YELLOW}--- Scanning System Logs for Security Anomaly Indicators ---${NC}"
+
+    # 1. Systemd Journal Analysis
+    if command -v journalctl &> /dev/null; then
+        echo -e "${CYAN}Scanning systemd journal (last 24h)...${NC}"
+        local journal_matches
+        journal_matches=$(journalctl --since "24 hours ago" -p warning..emerg --grep="$pattern_regex" --no-pager -n 15 2>/dev/null)
+        
+        if [[ -n "$journal_matches" ]]; then
+            echo -e "${RED}⚠️ Found suspicious entries in systemd journal:${NC}"
+            echo "$journal_matches"
+        else
+            echo -e "${GREEN}✓ No high-severity security anomalies found in systemd journal (last 24h).${NC}"
+        fi
+
+        local failed_count
+        failed_count=$(journalctl --since "24 hours ago" --grep="failed|invalid" --no-pager 2>/dev/null | wc -l)
+        echo -e "Failed authentication events (24h): ${CYAN}${failed_count}${NC}"
+        if [[ "$failed_count" -gt 20 ]]; then
+            echo -e "${RED}⚠️ High number of failed auth attempts detected (${failed_count})! Possible brute-force attack.${NC}"
+        fi
+    fi
+
+    # 2. Traditional Log Files Scan (/var/log/auth.log, /var/log/secure, /var/log/syslog)
+    local target_logs=()
+    [[ -f "/var/log/auth.log" ]] && target_logs+=("/var/log/auth.log")
+    [[ -f "/var/log/secure" ]] && target_logs+=("/var/log/secure")
+    [[ -f "/var/log/syslog" ]] && target_logs+=("/var/log/syslog")
+    [[ -f "/var/log/messages" ]] && target_logs+=("/var/log/messages")
+
+    if [[ ${#target_logs[@]} -gt 0 ]]; then
+        echo -e "\n${CYAN}Scanning security log files (${target_logs[*]})...${NC}"
+        for logfile in "${target_logs[@]}"; do
+            local file_matches
+            file_matches=$(sudo grep -Ei "$pattern_regex" "$logfile" 2>/dev/null | tail -n 10)
+            if [[ -n "$file_matches" ]]; then
+                echo -e "${YELLOW}Recent suspicious entries in ${logfile}:${NC}"
+                echo "$file_matches"
+            else
+                echo -e "${GREEN}✓ No critical security entries found in ${logfile}.${NC}"
+            fi
+        done
+    fi
+
+    echo -e "\n${YELLOW}--- Recent Sudo Usage & Privilege Escalation ---${NC}"
+    if [[ -f "/var/log/secure" ]]; then
+        sudo grep "sudo" /var/log/secure 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/secure."
+    elif [[ -f "/var/log/auth.log" ]]; then
+        sudo grep "sudo" /var/log/auth.log 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/auth.log."
+    else
+        sudo journalctl _COMM=sudo -n 10 --no-pager 2>/dev/null || echo "No sudo records found in journal."
+    fi
+}
+
+parse_security_logs
 
 # 9. System Optimization & Resource Audit
 section "9/11" "Checking System Resources & Optimization Opportunities..."
