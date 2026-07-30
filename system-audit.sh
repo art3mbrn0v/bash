@@ -32,8 +32,39 @@ section() {
     echo -e "\n${BLUE}[$1] $2${NC}"
 }
 
+# Helper function to update security databases before audit
+update_security_databases() {
+    echo -e "${YELLOW}--- Updating Security & Audit Tool Databases ---${NC}"
+
+    if command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
+        echo -n "Updating APT package index... "
+        sudo apt-get update -qq 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
+    elif command -v dnf &> /dev/null; then
+        echo -n "Refreshing DNF repository metadata... "
+        sudo dnf makecache --refresh &>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
+    fi
+
+    if command -v freshclam &> /dev/null; then
+        echo -n "Updating ClamAV virus signatures... "
+        sudo freshclam 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Updated or locked by daemon${NC}"
+    fi
+
+    if command -v rkhunter &> /dev/null; then
+        echo -n "Updating rkhunter rootkit definitions... "
+        sudo rkhunter --update 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Completed/Skipped${NC}"
+    fi
+
+    if command -v trivy &> /dev/null; then
+        echo -n "Updating Trivy vulnerability database... "
+        trivy image --download-db-only 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Up to date${NC}"
+    fi
+    echo ""
+}
+
+update_security_databases
+
 # 1. Shell History Scanning & Cleaning
-section "1/11" "Cleaning Shell History for Sensitive Data..."
+section "1/13" "Cleaning Shell History for Sensitive Data..."
 clean_history() {
     local file="$1"
     if [[ -f "$file" ]]; then
@@ -54,7 +85,7 @@ done
 echo -e "${GREEN}✓ History cleaned and permissions set to 600.${NC}"
 
 # 2. Certificate & File Permission Checks
-section "2/11" "Checking Minikube & SSH Certificate Permissions..."
+section "2/13" "Checking Minikube & SSH Certificate Permissions..."
 MINIKUBE_DIR="$HOME/.minikube"
 if [[ -d "$MINIKUBE_DIR" ]]; then
     CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
@@ -110,7 +141,7 @@ check_ssh_keys_passphrase() {
 check_ssh_keys_passphrase
 
 # 3. Application CVE Checks
-section "3/11" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
+section "3/13" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
 if command -v dnf &> /dev/null; then
     for app in "${APPS_TO_CHECK[@]}"; do
@@ -130,7 +161,7 @@ else
 fi
 
 # 4. SSH Configuration Audit
-section "4/11" "Auditing SSH Daemon Configuration..."
+section "4/13" "Auditing SSH Daemon Configuration..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
     ROOT_LOGIN=$(sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
@@ -153,7 +184,7 @@ else
 fi
 
 # 5. Network & Open Ports Audit
-section "5/11" "Checking Active Listening Ports & Firewall Status..."
+section "5/13" "Checking Active Listening Ports & Firewall Status..."
 if command -v systemctl &> /dev/null; then
     if systemctl is-active --quiet firewalld; then
         echo -e "${GREEN}✓ firewalld is active.${NC}"
@@ -181,7 +212,7 @@ if command -v ss &> /dev/null; then
 fi
 
 # 6. Antivirus & Security Daemon Checks (ClamAV & rkhunter)
-section "6/11" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
+section "6/13" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
 if command -v systemctl &> /dev/null && systemctl is-active --quiet clamav-freshclam; then
     echo -e "${GREEN}✓ clamav-freshclam service is active and managing database updates automatically.${NC}"
 elif command -v freshclam &> /dev/null; then
@@ -205,7 +236,7 @@ else
 fi
 
 # 7. Filesystem & Container Security Scanning (Trivy)
-section "7/11" "Trivy Code & Filesystem Security Scan..."
+section "7/13" "Trivy Code & Filesystem Security Scan..."
 if command -v trivy &> /dev/null; then
     trivy fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory"
 else
@@ -213,7 +244,7 @@ else
 fi
 
 # 8. System Log & Auth Audit
-section "8/11" "Analyzing System Logs & Parsing Suspicious Security Entries..."
+section "8/13" "Analyzing System Logs & Parsing Suspicious Security Entries..."
 
 parse_security_logs() {
     local pattern_regex="Failed password|Invalid user|authentication failure|NOT in sudoers|maximum authentication attempts|segfault|Out of memory: Kill process|denied"
@@ -275,7 +306,7 @@ parse_security_logs() {
 parse_security_logs
 
 # 9. System Optimization & Resource Audit
-section "9/11" "Checking System Resources & Optimization Opportunities..."
+section "9/13" "Checking System Resources & Optimization Opportunities..."
 echo -e "${YELLOW}--- Disk Space Usage & Free Space Check ---${NC}"
 df -h -x tmpfs -x devtmpfs -x squashfs
 
@@ -328,7 +359,7 @@ if command -v dnf &> /dev/null; then
 fi
 
 # 10. Privilege & Account Audit
-section "10/11" "Privilege & Security Misconfiguration Audit..."
+section "10/13" "Privilege & Security Misconfiguration Audit..."
 echo -e "${YELLOW}--- Checking for Non-Root Accounts with UID 0 ---${NC}"
 UID_ZERO=$(awk -F: '($3 == "0" && $1 != "root") { print $1 }' /etc/passwd)
 if [[ -n "$UID_ZERO" ]]; then
@@ -375,7 +406,7 @@ check_console_users() {
 check_console_users
 
 # 11. Repository Kernel & Security Package Updates Audit
-section "11/11" "Auditing Repository Kernel Updates & Recommended Security Packages..."
+section "11/13" "Auditing Repository Kernel Updates & Recommended Security Packages..."
 RUNNING_KERNEL=$(uname -r)
 echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
 
@@ -454,6 +485,182 @@ elif command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
 else
     echo -e "${YELLOW}Unsupported package manager. Skipping repository kernel & package audit.${NC}"
 fi
+
+# 12. Suspicious Process & Threat Detection Audit
+section "12/13" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
+
+audit_suspicious_processes() {
+    local threats_found=0
+
+    echo -e "${YELLOW}--- 1. Checking for Processes Running Deleted Executables (Process Hiding) ---${NC}"
+    local deleted_procs=""
+    for exe in /proc/[0-9]*/exe; do
+        local target
+        target=$(readlink "$exe" 2>/dev/null)
+        if [[ "$target" =~ \(deleted\)$ ]]; then
+            local pid
+            pid=$(echo "$exe" | cut -d/ -f3)
+            local user
+            user=$(ps -p "$pid" -o user= 2>/dev/null)
+            local cmd
+            cmd=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+            deleted_procs+="  - ${RED}PID ${pid}${NC} (User: ${user}) -> ${target}\n    Command: ${cmd}\n"
+            ((threats_found++))
+        fi
+    done
+    if [[ -n "$deleted_procs" ]]; then
+        echo -e "${RED}⚠️ CRITICAL: Processes executing deleted binary files detected!${NC}"
+        echo -e "$deleted_procs"
+    else
+        echo -e "${GREEN}✓ No processes running deleted binaries found.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- 2. Checking for Processes Executing from Temporary Directories (/tmp, /dev/shm) ---${NC}"
+    local temp_procs=""
+    for exe in /proc/[0-9]*/exe; do
+        local target
+        target=$(readlink "$exe" 2>/dev/null)
+        if [[ "$target" =~ ^/tmp/|^/var/tmp/|^/dev/shm/ ]]; then
+            local pid
+            pid=$(echo "$exe" | cut -d/ -f3)
+            local user
+            user=$(ps -p "$pid" -o user= 2>/dev/null)
+            local cmd
+            cmd=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+            temp_procs+="  - ${RED}PID ${pid}${NC} (User: ${user}) -> ${target}\n    Command: ${cmd}\n"
+            ((threats_found++))
+        fi
+    done
+    if [[ -n "$temp_procs" ]]; then
+        echo -e "${RED}⚠️ WARNING: Processes running from temporary/volatile directories found:${NC}"
+        echo -e "$temp_procs"
+    else
+        echo -e "${GREEN}✓ No processes executing from /tmp, /var/tmp, or /dev/shm.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- 3. Checking for Known Miner & Suspicious Tool Signatures ---${NC}"
+    local miner_pattern="xmrig|minerd|cgminer|cpuminer|kworkerds|stratum|masscan|zmap|kinsing|sysupdate"
+    local suspicious_procs
+    suspicious_procs=$(ps aux 2>/dev/null | grep -Ei "$miner_pattern" | grep -vE "grep|system-audit.sh")
+    if [[ -n "$suspicious_procs" ]]; then
+        echo -e "${RED}⚠️ ALERT: Known suspicious miner or scanning tools detected:${NC}"
+        echo "$suspicious_procs"
+        ((threats_found++))
+    else
+        echo -e "${GREEN}✓ No known miner or scanning tool signatures detected.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- 4. Checking for Potential Reverse Shell Patterns ---${NC}"
+    local revshell_pattern="nc -e|nc\.openbsd -e|bash -i|sh -i|python.*socket|perl.*socket|php -r.*socket"
+    local revshell_procs
+    revshell_procs=$(ps aux 2>/dev/null | grep -Ei "$revshell_pattern" | grep -vE "grep|system-audit.sh")
+    if [[ -n "$revshell_procs" ]]; then
+        echo -e "${RED}⚠️ ALERT: Potential reverse shell processes detected:${NC}"
+        echo "$revshell_procs"
+        ((threats_found++))
+    else
+        echo -e "${GREEN}✓ No reverse shell command patterns detected.${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- 5. Top CPU & RAM Consuming Processes ---${NC}"
+    echo -e "${CYAN}Highest CPU Processes (>70% CPU):${NC}"
+    local high_cpu
+    high_cpu=$(ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | awk 'NR>1 && $3 > 70.0 {print $0}')
+    if [[ -n "$high_cpu" ]]; then
+        echo -e "${YELLOW}$high_cpu${NC}"
+    else
+        echo -e "${GREEN}✓ No processes consuming excessive CPU (>70%).${NC}"
+    fi
+
+    echo -e "${CYAN}Highest RAM Consuming Processes (Top 5):${NC}"
+    ps -eo pid,user,%cpu,%mem,comm --sort=-%mem | head -n 6
+}
+
+audit_suspicious_processes
+
+# 13. Shell Configuration & Security Alias Audit
+section "13/13" "Auditing Shell Config Files (.bashrc, .zshrc) & Security Aliases (All Users)..."
+
+audit_shell_configs_and_aliases() {
+    local target_rc_files=(".bashrc" ".zshrc" ".profile" ".bash_profile" ".zprofile" ".bash_aliases" ".zsh_aliases")
+
+    while IFS=: read -r username password uid gid gecos home shell; do
+        [[ -d "$home" ]] || continue
+
+        local user_rc_found=()
+        for rc in "${target_rc_files[@]}"; do
+            local rc_path="$home/$rc"
+            [[ -f "$rc_path" ]] && user_rc_found+=("$rc_path")
+        done
+
+        [[ ${#user_rc_found[@]} -gt 0 ]] || continue
+
+        echo -e "\n${CYAN}--- User '${username}' Shell Configuration Audit (${user_rc_found[*]}) ---${NC}"
+
+        local suspicious_findings=""
+        local hijacking_patterns="alias (sudo|su|ssh|cd|ls|cat|curl|wget)="
+        local dangerous_exec_patterns="curl.*\|.*(bash|sh)|wget.*\|.*(bash|sh)|eval \$\(|base64 -d"
+
+        for rc_path in "${user_rc_found[@]}"; do
+            local found_suspicious
+            found_suspicious=$(grep -Ei "$hijacking_patterns" "$rc_path" 2>/dev/null | grep -vE "alias ls='ls --color|alias ll=|alias la=")
+            if [[ -n "$found_suspicious" ]]; then
+                suspicious_findings+="  - ${RED}Suspicious alias in ${rc_path}:${NC}\n$found_suspicious\n"
+            fi
+
+            local found_exec
+            found_exec=$(grep -Ei "$dangerous_exec_patterns" "$rc_path" 2>/dev/null)
+            if [[ -n "$found_exec" ]]; then
+                suspicious_findings+="  - ${RED}Dangerous execution pattern in ${rc_path}:${NC}\n$found_exec\n"
+            fi
+        done
+
+        if [[ -n "$suspicious_findings" ]]; then
+            echo -e "${RED}⚠️ Suspicious aliases or remote execution patterns detected:${NC}"
+            echo -e "$suspicious_findings"
+        else
+            echo -e "${GREEN}✓ No suspicious alias hijacking or remote code execution patterns found.${NC}"
+        fi
+
+        local has_rm_safe=0
+        local has_cp_safe=0
+        local has_mv_safe=0
+        local has_preserve_root=0
+
+        for rc_path in "${user_rc_found[@]}"; do
+            grep -Eq "alias rm=['\"].*rm.*-i" "$rc_path" 2>/dev/null && has_rm_safe=1
+            grep -Eq "alias cp=['\"].*cp.*-i" "$rc_path" 2>/dev/null && has_cp_safe=1
+            grep -Eq "alias mv=['\"].*mv.*-i" "$rc_path" 2>/dev/null && has_mv_safe=1
+            grep -Eq "preserve-root" "$rc_path" 2>/dev/null && has_preserve_root=1
+        done
+
+        echo -e "${YELLOW}Safety Aliases & Protection Recommendations:${NC}"
+        if [[ "$has_rm_safe" -eq 1 ]]; then
+            echo -e "  - 'rm' safety alias: ${GREEN}Enabled${NC}"
+        else
+            echo -e "  - 'rm' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias rm='rm -i'${NC} to ${user_rc_found[0]} to prevent accidental 'rm -rf' data loss."
+        fi
+
+        if [[ "$has_cp_safe" -eq 1 ]]; then
+            echo -e "  - 'cp' safety alias: ${GREEN}Enabled${NC}"
+        else
+            echo -e "  - 'cp' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias cp='cp -i'${NC} to ${user_rc_found[0]} to prevent overwriting files."
+        fi
+
+        if [[ "$has_mv_safe" -eq 1 ]]; then
+            echo -e "  - 'mv' safety alias: ${GREEN}Enabled${NC}"
+        else
+            echo -e "  - 'mv' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias mv='mv -i'${NC} to ${user_rc_found[0]} to prevent overwriting files."
+        fi
+
+        if [[ "$has_preserve_root" -eq 0 ]]; then
+            echo -e "  - Extra safety recommendation: Add ${CYAN}alias chown='chown --preserve-root'${NC} and ${CYAN}alias chmod='chmod --preserve-root'${NC} to ${user_rc_found[0]}"
+        fi
+
+    done < /etc/passwd
+}
+
+audit_shell_configs_and_aliases
 
 echo -e "\n${CYAN}=====================================================${NC}"
 echo -e "${GREEN}=== Audit Completed Successfully! ===${NC}"
