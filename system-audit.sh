@@ -23,9 +23,56 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# Command Line Options
+AUTO_FIX=false
+GENERATE_REPORT=false
+REPORT_DIR="$HOME/Labolatory/bash/reports"
+
+for arg in "$@"; do
+    case "$arg" in
+        --fix|-f)
+            AUTO_FIX=true
+            ;;
+        --report|-r)
+            GENERATE_REPORT=true
+            ;;
+        --help|-h)
+            printf "Usage: %s [OPTIONS]\n" "$0"
+            printf "Options:\n"
+            printf "  -f, --fix     Automatically fix permissions & add safety aliases\n"
+            printf "  -r, --report  Generate Markdown report log in %s\n" "$REPORT_DIR"
+            printf "  -h, --help    Show this help message\n"
+            exit 0
+            ;;
+    esac
+done
+
+if [[ "$GENERATE_REPORT" == true ]]; then
+    mkdir -p "$REPORT_DIR"
+    REPORT_FILE="$REPORT_DIR/audit-report-$(date +%Y-%m-%d_%H-%M-%S).md"
+    exec > >(tee -a "$REPORT_FILE") 2>&1
+fi
+
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}=== Starting System Security & Optimization Audit ===${NC}"
 echo -e "${CYAN}=====================================================${NC}"
+
+if [[ "$AUTO_FIX" == true ]]; then
+    echo -e "${YELLOW}=== Running in Auto-Fix Mode (--fix enabled) ===${NC}"
+    chmod 700 "$HOME/.ssh" 2>/dev/null
+    chmod 600 "$HOME/.ssh"/* 2>/dev/null
+    if [[ -d "$HOME/.minikube" ]]; then
+        find "$HOME/.minikube" -name "*.pem" -exec chmod 600 {} + 2>/dev/null
+    fi
+    for rc_file in "$HOME/.zshrc" "$HOME/.bashrc"; do
+        if [[ -f "$rc_file" ]]; then
+            grep -q "alias rm=" "$rc_file" 2>/dev/null || echo "alias rm='rm -i'" >> "$rc_file"
+            grep -q "alias cp=" "$rc_file" 2>/dev/null || echo "alias cp='cp -i'" >> "$rc_file"
+            grep -q "alias mv=" "$rc_file" 2>/dev/null || echo "alias mv='mv -i'" >> "$rc_file"
+        fi
+    done
+    echo -e "${GREEN}✓ Auto-fix completed: Permissions & safety aliases applied.${NC}\n"
+fi
 
 # Helper function to print section headers
 section() {
@@ -64,7 +111,7 @@ update_security_databases() {
 update_security_databases
 
 # 1. Shell History Scanning & Cleaning
-section "1/13" "Cleaning Shell History for Sensitive Data..."
+section "1/19" "Cleaning Shell History for Sensitive Data..."
 clean_history() {
     local file="$1"
     if [[ -f "$file" ]]; then
@@ -85,7 +132,7 @@ done
 echo -e "${GREEN}✓ History cleaned and permissions set to 600.${NC}"
 
 # 2. Certificate & File Permission Checks
-section "2/13" "Checking Minikube & SSH Certificate Permissions..."
+section "2/19" "Checking Minikube & SSH Certificate Permissions..."
 MINIKUBE_DIR="$HOME/.minikube"
 if [[ -d "$MINIKUBE_DIR" ]]; then
     CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
@@ -141,7 +188,7 @@ check_ssh_keys_passphrase() {
 check_ssh_keys_passphrase
 
 # 3. Application CVE Checks
-section "3/13" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
+section "3/19" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
 if command -v dnf &> /dev/null; then
     for app in "${APPS_TO_CHECK[@]}"; do
@@ -161,7 +208,7 @@ else
 fi
 
 # 4. SSH Configuration Audit
-section "4/13" "Auditing SSH Daemon Configuration..."
+section "4/19" "Auditing SSH Daemon Configuration..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
     ROOT_LOGIN=$(sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
@@ -184,7 +231,7 @@ else
 fi
 
 # 5. Network & Open Ports Audit
-section "5/13" "Checking Active Listening Ports & Firewall Status..."
+section "5/19" "Checking Active Listening Ports & Firewall Status..."
 if command -v systemctl &> /dev/null; then
     if systemctl is-active --quiet firewalld; then
         echo -e "${GREEN}✓ firewalld is active.${NC}"
@@ -212,7 +259,7 @@ if command -v ss &> /dev/null; then
 fi
 
 # 6. Antivirus & Security Daemon Checks (ClamAV & rkhunter)
-section "6/13" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
+section "6/19" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
 if command -v systemctl &> /dev/null && systemctl is-active --quiet clamav-freshclam; then
     echo -e "${GREEN}✓ clamav-freshclam service is active and managing database updates automatically.${NC}"
 elif command -v freshclam &> /dev/null; then
@@ -236,7 +283,7 @@ else
 fi
 
 # 7. Filesystem & Container Security Scanning (Trivy)
-section "7/13" "Trivy Code & Filesystem Security Scan..."
+section "7/19" "Trivy Code & Filesystem Security Scan..."
 if command -v trivy &> /dev/null; then
     trivy fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory"
 else
@@ -244,7 +291,7 @@ else
 fi
 
 # 8. System Log & Auth Audit
-section "8/13" "Analyzing System Logs & Parsing Suspicious Security Entries..."
+section "8/19" "Analyzing System Logs & Parsing Suspicious Security Entries..."
 
 parse_security_logs() {
     local pattern_regex="Failed password|Invalid user|authentication failure|NOT in sudoers|maximum authentication attempts|segfault|Out of memory: Kill process|denied"
@@ -306,7 +353,7 @@ parse_security_logs() {
 parse_security_logs
 
 # 9. System Optimization & Resource Audit
-section "9/13" "Checking System Resources & Optimization Opportunities..."
+section "9/19" "Checking System Resources & Optimization Opportunities..."
 echo -e "${YELLOW}--- Disk Space Usage & Free Space Check ---${NC}"
 df -h -x tmpfs -x devtmpfs -x squashfs
 
@@ -359,7 +406,7 @@ if command -v dnf &> /dev/null; then
 fi
 
 # 10. Privilege & Account Audit
-section "10/13" "Privilege & Security Misconfiguration Audit..."
+section "10/19" "Privilege & Security Misconfiguration Audit..."
 echo -e "${YELLOW}--- Checking for Non-Root Accounts with UID 0 ---${NC}"
 UID_ZERO=$(awk -F: '($3 == "0" && $1 != "root") { print $1 }' /etc/passwd)
 if [[ -n "$UID_ZERO" ]]; then
@@ -406,7 +453,7 @@ check_console_users() {
 check_console_users
 
 # 11. Repository Kernel & Security Package Updates Audit
-section "11/13" "Auditing Repository Kernel Updates & Recommended Security Packages..."
+section "11/19" "Auditing Repository Kernel Updates & Recommended Security Packages..."
 RUNNING_KERNEL=$(uname -r)
 echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
 
@@ -487,7 +534,7 @@ else
 fi
 
 # 12. Suspicious Process & Threat Detection Audit
-section "12/13" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
+section "12/19" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
 
 audit_suspicious_processes() {
     local threats_found=0
@@ -579,7 +626,7 @@ audit_suspicious_processes() {
 audit_suspicious_processes
 
 # 13. Shell Configuration & Security Alias Audit
-section "13/13" "Auditing Shell Config Files (.bashrc, .zshrc) & Security Aliases (All Users)..."
+section "13/19" "Auditing Shell Config Files (.bashrc, .zshrc) & Security Aliases (All Users)..."
 
 audit_shell_configs_and_aliases() {
     local target_rc_files=(".bashrc" ".zshrc" ".profile" ".bash_profile" ".zprofile" ".bash_aliases" ".zsh_aliases")
@@ -662,6 +709,151 @@ audit_shell_configs_and_aliases() {
 
 audit_shell_configs_and_aliases
 
+# 14. SUID / SGID Executable File Audit
+section "14/19" "Auditing SUID / SGID Files for Privilege Escalation Risk..."
+audit_suid_files() {
+    echo -e "${YELLOW}--- Scanning for SUID/SGID Binaries in Volatile / Non-Standard Paths ---${NC}"
+    local suspicious_suid
+    suspicious_suid=$(find /tmp /var/tmp /dev/shm /home -perm -4000 -o -perm -2000 2>/dev/null)
+    if [[ -n "$suspicious_suid" ]]; then
+        echo -e "${RED}⚠️ CRITICAL! SUID/SGID files found in non-standard/writable paths:${NC}"
+        echo "$suspicious_suid"
+    else
+        echo -e "${GREEN}✓ No SUID/SGID files found in volatile/user paths (/tmp, /dev/shm, /home).${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- System SUID Executables Count ---${NC}"
+    local suid_count
+    suid_count=$(find /usr/bin /usr/sbin /bin /sbin -perm -4000 2>/dev/null | wc -l)
+    echo -e "Total SUID binaries in system paths: ${CYAN}${suid_count}${NC}"
+}
+audit_suid_files
+
+# 15. Persistence Audit (Cron Jobs & Systemd Timers)
+section "15/19" "Auditing System Persistence (Cron Jobs & Systemd Timers)..."
+audit_persistence() {
+    echo -e "${YELLOW}--- User Cron Jobs Audit ---${NC}"
+    while IFS=: read -r username password uid gid gecos home shell; do
+        local crontab_out
+        crontab_out=$(crontab -u "$username" -l 2>/dev/null | grep -v '^#')
+        if [[ -n "$crontab_out" ]]; then
+            echo -e "${CYAN}Crontab for user '${username}':${NC}"
+            echo "$crontab_out"
+        fi
+    done < /etc/passwd
+
+    echo -e "\n${YELLOW}--- System Cron Files (/etc/crontab, /etc/cron.*) ---${NC}"
+    if [[ -f "/etc/crontab" ]]; then
+        grep -v '^#' /etc/crontab | grep -v '^\s*$' || echo "No custom jobs in /etc/crontab."
+    fi
+
+    echo -e "\n${YELLOW}--- Active Systemd Timers ---${NC}"
+    if command -v systemctl &>/dev/null; then
+        systemctl list-timers --no-pager --no-legend 2>/dev/null | head -n 10
+    fi
+}
+audit_persistence
+
+# 16. SSH authorized_keys Audit (All Users)
+section "16/19" "Auditing SSH Authorized Keys Across All Users..."
+audit_authorized_keys() {
+    local keys_count=0
+    while IFS=: read -r username password uid gid gecos home shell; do
+        local auth_keys="$home/.ssh/authorized_keys"
+        if [[ -f "$auth_keys" ]]; then
+            local key_num
+            key_num=$(grep -v '^#' "$auth_keys" | grep -v '^\s*$' | wc -l)
+            if [[ "$key_num" -gt 0 ]]; then
+                ((keys_count += key_num))
+                echo -e "  - User ${CYAN}${username}${NC}: ${key_num} authorized key(s) in ${auth_keys}"
+                if [[ "$username" == "root" ]]; then
+                    echo -e "    ${RED}⚠️ Warning: Root account has SSH authorized keys configured!${NC}"
+                fi
+            fi
+        fi
+    done < /etc/passwd
+
+    if [[ "$keys_count" -eq 0 ]]; then
+        echo -e "${GREEN}✓ No authorized_keys files found.${NC}"
+    fi
+}
+audit_authorized_keys
+
+# 17. Docker & Kubernetes Container Security Audit
+section "17/19" "Auditing Docker & Container Security Settings..."
+audit_container_security() {
+    if [[ -S "/var/run/docker.sock" ]]; then
+        local sock_perm
+        sock_perm=$(ls -l /var/run/docker.sock 2>/dev/null)
+        echo -e "Docker socket status: ${CYAN}${sock_perm}${NC}"
+    else
+        echo "Docker socket (/var/run/docker.sock) not active."
+    fi
+
+    if command -v docker &>/dev/null && docker ps &>/dev/null; then
+        echo -e "\n${YELLOW}--- Running Docker Containers ---${NC}"
+        local priv_containers
+        priv_containers=$(docker ps --quiet | xargs docker inspect --format '{{ .Id }}: Privileged={{ .HostConfig.Privileged }}' 2>/dev/null | grep 'Privileged=true')
+        if [[ -n "$priv_containers" ]]; then
+            echo -e "${RED}⚠️ Privileged containers detected:${NC}\n$priv_containers"
+        else
+            echo -e "${GREEN}✓ No privileged Docker containers running.${NC}"
+        fi
+    fi
+}
+audit_container_security
+
+# 18. Kernel Security Hardening (Sysctl Parameters Audit)
+section "18/19" "Auditing Kernel Security Hardening (sysctl Parameters)..."
+audit_kernel_hardening() {
+    local SYSCTL_BIN="sysctl"
+    command -v sysctl &>/dev/null || SYSCTL_BIN="/usr/sbin/sysctl"
+
+    check_sysctl() {
+        local param="$1"
+        local expected="$2"
+        local val
+        val=$($SYSCTL_BIN -n "$param" 2>/dev/null)
+        if [[ "$val" == "$expected" ]]; then
+            echo -e "  - ${param}: ${GREEN}${val}${NC} (Secure)"
+        else
+            echo -e "  - ${param}: ${YELLOW}${val}${NC} (Recommended: ${expected})"
+        fi
+    }
+
+    check_sysctl "net.ipv4.ip_forward" "0"
+    check_sysctl "kernel.kptr_restrict" "1"
+    check_sysctl "kernel.dmesg_restrict" "1"
+    check_sysctl "fs.protected_symlinks" "1"
+    check_sysctl "fs.protected_hardlinks" "1"
+}
+audit_kernel_hardening
+
+# 19. Network DNS & /etc/hosts Integrity Audit
+section "19/19" "Auditing DNS Settings & /etc/hosts Integrity..."
+audit_dns_hosts() {
+    echo -e "${YELLOW}--- DNS Resolvers (/etc/resolv.conf) ---${NC}"
+    if [[ -f "/etc/resolv.conf" ]]; then
+        grep '^nameserver' /etc/resolv.conf | sed 's/^/  - /'
+    fi
+
+    echo -e "\n${YELLOW}--- /etc/hosts Non-Standard Entries Check ---${NC}"
+    if [[ -f "/etc/hosts" ]]; then
+        local custom_hosts
+        custom_hosts=$(grep -vE '^\s*#|localhost|127\.0\.0\.1|::1|fe00::0|ff02::' /etc/hosts | grep -v '^\s*$')
+        if [[ -n "$custom_hosts" ]]; then
+            echo -e "${CYAN}Custom /etc/hosts entries:${NC}"
+            echo "$custom_hosts"
+        else
+            echo -e "${GREEN}✓ No unusual custom entries in /etc/hosts.${NC}"
+        fi
+    fi
+}
+audit_dns_hosts
+
 echo -e "\n${CYAN}=====================================================${NC}"
 echo -e "${GREEN}=== Audit Completed Successfully! ===${NC}"
+if [[ "$GENERATE_REPORT" == true ]]; then
+    echo -e "${GREEN}Report saved to: ${REPORT_FILE}${NC}"
+fi
 echo -e "${CYAN}=====================================================${NC}"
