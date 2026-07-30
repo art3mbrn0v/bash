@@ -33,7 +33,7 @@ section() {
 }
 
 # 1. Shell History Scanning & Cleaning
-section "1/10" "Cleaning Shell History for Sensitive Data..."
+section "1/11" "Cleaning Shell History for Sensitive Data..."
 clean_history() {
     local file="$1"
     if [[ -f "$file" ]]; then
@@ -54,7 +54,7 @@ done
 echo -e "${GREEN}✓ History cleaned and permissions set to 600.${NC}"
 
 # 2. Certificate & File Permission Checks
-section "2/10" "Checking Minikube & SSH Certificate Permissions..."
+section "2/11" "Checking Minikube & SSH Certificate Permissions..."
 MINIKUBE_DIR="$HOME/.minikube"
 if [[ -d "$MINIKUBE_DIR" ]]; then
     CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
@@ -78,7 +78,7 @@ if [[ -d "$HOME/.ssh" ]]; then
 fi
 
 # 3. Application CVE Checks
-section "3/10" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
+section "3/11" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
 if command -v dnf &> /dev/null; then
     for app in "${APPS_TO_CHECK[@]}"; do
@@ -98,7 +98,7 @@ else
 fi
 
 # 4. SSH Configuration Audit
-section "4/10" "Auditing SSH Daemon Configuration..."
+section "4/11" "Auditing SSH Daemon Configuration..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
     ROOT_LOGIN=$(sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
@@ -121,7 +121,7 @@ else
 fi
 
 # 5. Network & Open Ports Audit
-section "5/10" "Checking Active Listening Ports & Firewall Status..."
+section "5/11" "Checking Active Listening Ports & Firewall Status..."
 if command -v systemctl &> /dev/null; then
     if systemctl is-active --quiet firewalld; then
         echo -e "${GREEN}✓ firewalld is active.${NC}"
@@ -149,7 +149,7 @@ if command -v ss &> /dev/null; then
 fi
 
 # 6. Antivirus & Security Daemon Checks (ClamAV & rkhunter)
-section "6/10" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
+section "6/11" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
 if command -v systemctl &> /dev/null && systemctl is-active --quiet clamav-freshclam; then
     echo -e "${GREEN}✓ clamav-freshclam service is active and managing database updates automatically.${NC}"
 elif command -v freshclam &> /dev/null; then
@@ -173,7 +173,7 @@ else
 fi
 
 # 7. Filesystem & Container Security Scanning (Trivy)
-section "7/10" "Trivy Code & Filesystem Security Scan..."
+section "7/11" "Trivy Code & Filesystem Security Scan..."
 if command -v trivy &> /dev/null; then
     trivy fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory"
 else
@@ -181,7 +181,7 @@ else
 fi
 
 # 8. System Log & Auth Audit
-section "8/10" "Analyzing System Logs for Suspicious Activity..."
+section "8/11" "Analyzing System Logs for Suspicious Activity..."
 echo -e "${YELLOW}--- Failed Auth Attempts (Last 10) ---${NC}"
 if [[ -f "/var/log/secure" ]]; then
     sudo grep -i "failed" /var/log/secure 2>/dev/null | tail -n 10 || echo "No failed attempts in /var/log/secure."
@@ -197,7 +197,7 @@ else
 fi
 
 # 9. System Optimization & Resource Audit
-section "9/10" "Checking System Resources & Optimization Opportunities..."
+section "9/11" "Checking System Resources & Optimization Opportunities..."
 echo -e "${YELLOW}--- Disk Space Usage ---${NC}"
 df -h --total -x tmpfs -x devtmpfs | grep -E 'Filesystem|total|/[a-z]*$'
 
@@ -233,13 +233,94 @@ if command -v dnf &> /dev/null; then
 fi
 
 # 10. Privilege & Account Audit
-section "10/10" "Privilege & Security Misconfiguration Audit..."
+section "10/11" "Privilege & Security Misconfiguration Audit..."
 echo -e "${YELLOW}--- Checking for Non-Root Accounts with UID 0 ---${NC}"
 UID_ZERO=$(awk -F: '($3 == "0" && $1 != "root") { print $1 }' /etc/passwd)
 if [[ -n "$UID_ZERO" ]]; then
     echo -e "${RED}CRITICAL! Non-root users with UID 0 found:${NC} $UID_ZERO"
 else
     echo -e "${GREEN}✓ Only root user has UID 0.${NC}"
+fi
+
+# 11. Repository Kernel & Security Package Updates Audit
+section "11/11" "Auditing Repository Kernel Updates & Recommended Security Packages..."
+RUNNING_KERNEL=$(uname -r)
+echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
+
+if command -v dnf &> /dev/null || command -v yum &> /dev/null; then
+    PKG_MGR="dnf"
+    command -v dnf &> /dev/null || PKG_MGR="yum"
+    echo -e "Detected package manager: ${BLUE}${PKG_MGR}${NC} (RedHat/Fedora family)"
+
+    echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
+    KERNEL_UPDATES=$($PKG_MGR check-update kernel kernel-core kernel-modules 2>/dev/null | grep -E '^kernel(-core|-modules)?\.')
+    if [[ -n "$KERNEL_UPDATES" ]]; then
+        echo -e "${RED}⚠️ New kernel update available in repository:${NC}"
+        echo "$KERNEL_UPDATES"
+    else
+        echo -e "${GREEN}✓ Kernel is up to date in repository.${NC}"
+    fi
+
+    LATEST_INSTALLED_KERNEL=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | tail -n 1)
+    if [[ -z "$LATEST_INSTALLED_KERNEL" ]]; then
+        LATEST_INSTALLED_KERNEL=$(rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | tail -n 1)
+    fi
+    if [[ -n "$LATEST_INSTALLED_KERNEL" && "$RUNNING_KERNEL" != "$LATEST_INSTALLED_KERNEL"* ]]; then
+        echo -e "${YELLOW}⚠️ System reboot required! Running kernel ($RUNNING_KERNEL) differs from installed ($LATEST_INSTALLED_KERNEL).${NC}"
+    fi
+
+    echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
+    RECOMMENDED_PKGS=("fail2ban" "firewalld" "audit" "clamav" "rkhunter" "trivy" "policycoreutils" "crypto-policies")
+    for pkg in "${RECOMMENDED_PKGS[@]}"; do
+        if rpm -q "$pkg" &> /dev/null; then
+            PKG_UPDATE=$($PKG_MGR check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\.")
+            if [[ -n "$PKG_UPDATE" ]]; then
+                echo -e "  - $pkg: ${GREEN}Installed${NC} | ${RED}Update Available in Repo${NC}"
+            else
+                echo -e "  - $pkg: ${GREEN}Installed (Up to date)${NC}"
+            fi
+        else
+            echo -e "  - $pkg: ${YELLOW}Not installed${NC} (Recommended for security)"
+        fi
+    done
+
+elif command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
+    echo -e "Detected package manager: ${BLUE}apt${NC} (Debian family)"
+
+    echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
+    KERNEL_UPDATES=$(apt list --upgradable 2>/dev/null | grep -E '^linux-(image|headers|generic|amd64|arm64)')
+    if [[ -n "$KERNEL_UPDATES" ]]; then
+        echo -e "${RED}⚠️ New kernel update available in repository:${NC}"
+        echo "$KERNEL_UPDATES"
+    else
+        echo -e "${GREEN}✓ Kernel is up to date in repository.${NC}"
+    fi
+
+    if [[ -f "/var/run/reboot-required" ]]; then
+        echo -e "${YELLOW}⚠️ System reboot required! (/var/run/reboot-required exists)${NC}"
+        if [[ -f "/var/run/reboot-required.pkgs" ]]; then
+            echo "Packages requiring reboot:"
+            cat /var/run/reboot-required.pkgs | sed 's/^/  - /'
+        fi
+    fi
+
+    echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
+    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "rkhunter" "trivy" "needrestart")
+    for pkg in "${RECOMMENDED_PKGS[@]}"; do
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
+            PKG_UPDATE=$(apt list --upgradable 2>/dev/null | grep -E "^${pkg}/")
+            if [[ -n "$PKG_UPDATE" ]]; then
+                echo -e "  - $pkg: ${GREEN}Installed${NC} | ${RED}Update Available in Repo${NC}"
+            else
+                echo -e "  - $pkg: ${GREEN}Installed (Up to date)${NC}"
+            fi
+        else
+            echo -e "  - $pkg: ${YELLOW}Not installed${NC} (Recommended for security)"
+        fi
+    done
+
+else
+    echo -e "${YELLOW}Unsupported package manager. Skipping repository kernel & package audit.${NC}"
 fi
 
 echo -e "\n${CYAN}=====================================================${NC}"
