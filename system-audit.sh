@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# System Security & Optimization Audit Script
+# Comprehensive System Security & Optimization Audit Script
 # ==============================================================================
 
 # --- Configuration ---
@@ -28,6 +28,12 @@ AUTO_FIX=false
 GENERATE_REPORT=false
 REPORT_DIR="$HOME/Labolatory/bash/reports"
 
+# Executive Scorecard Counters
+PASSED_COUNT=0
+WARNING_COUNT=0
+CRITICAL_COUNT=0
+TOTAL_CHECKS=0
+
 for arg in "$@"; do
     case "$arg" in
         --fix|-f)
@@ -50,12 +56,116 @@ done
 if [[ "$GENERATE_REPORT" == true ]]; then
     mkdir -p "$REPORT_DIR"
     REPORT_FILE="$REPORT_DIR/audit-report-$(date +%Y-%m-%d_%H-%M-%S).md"
-    exec > >(tee -a "$REPORT_FILE") 2>&1
+    exec > >(tee >(sed -r 's/\x1B\[[0-9;]*[mK]//g' > "$REPORT_FILE")) 2>&1
 fi
 
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}=== Starting System Security & Optimization Audit ===${NC}"
 echo -e "${CYAN}=====================================================${NC}"
+
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${YELLOW}Note: Running as non-root user. Deep system inspections (system logs, rootkit scans, password hashes) may be limited.${NC}"
+    echo -e "${YELLOW}Tip: For complete audit coverage, run with 'sudo $0'\n${NC}"
+fi
+
+# --- Helper Functions & Tool Resolution ---
+
+section() {
+    echo -e "\n${BLUE}[$1] $2${NC}"
+}
+
+log_pass() {
+    ((PASSED_COUNT++))
+    ((TOTAL_CHECKS++))
+    echo -e "${GREEN}✓ $1${NC}"
+}
+
+log_warn() {
+    ((WARNING_COUNT++))
+    ((TOTAL_CHECKS++))
+    echo -e "${YELLOW}⚠️ $1${NC}"
+}
+
+log_crit() {
+    ((CRITICAL_COUNT++))
+    ((TOTAL_CHECKS++))
+    echo -e "${RED}⚠️ CRITICAL: $1${NC}"
+}
+
+# Safe sudo execution wrapper (avoids hanging in non-interactive scripts)
+run_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    elif sudo -n true 2>/dev/null; then
+        sudo "$@"
+    elif [[ -t 0 ]]; then
+        sudo "$@"
+    else
+        return 1
+    fi
+}
+
+# Helper to find tool paths in standard and system binary paths
+find_tool() {
+    local tool="$1"
+    local path
+    path=$(command -v "$tool" 2>/dev/null)
+    if [[ -z "$path" ]]; then
+        for extra_path in "/sbin/$tool" "/usr/sbin/$tool" "/usr/local/bin/$tool"; do
+            if [[ -x "$extra_path" ]]; then
+                path="$extra_path"
+                break
+            fi
+        done
+    fi
+    echo "$path"
+}
+
+# --- Tool Cache & Pre-Flight Dependency Inspection ---
+declare -A TOOL_BIN
+declare -A TOOL_FOUND
+
+TOOLS_TO_CHECK=(
+    "sudo" "systemctl" "journalctl" "ss" "sysctl" "ssh-keygen" 
+    "crontab" "ip" "df" "awk" "grep" "sed" "find" "clamscan" 
+    "freshclam" "rkhunter" "trivy" "nmcli" "nmap" "docker" "podman"
+    "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
+)
+
+check_all_dependencies() {
+    echo -e "${YELLOW}=== Pre-Flight Security Tools & Dependency Check ===${NC}"
+    local missing_tools=()
+
+    for tool in "${TOOLS_TO_CHECK[@]}"; do
+        local path
+        path=$(find_tool "$tool")
+        if [[ -n "$path" ]]; then
+            TOOL_BIN["$tool"]="$path"
+            TOOL_FOUND["$tool"]=1
+            printf "  [${GREEN}✓${NC}] %-15s : Installed (%s)\n" "$tool" "$path"
+        else
+            TOOL_FOUND["$tool"]=0
+            printf "  [${YELLOW}!${NC}] %-15s : ${YELLOW}NOT installed${NC}\n" "$tool"
+            case "$tool" in
+                clamscan|freshclam|rkhunter|trivy|nmap|lynis|needrestart|debsums)
+                    missing_tools+=("$tool")
+                    ;;
+            esac
+        fi
+    done
+
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        echo -e "\n${YELLOW}Recommended Security Tools Installation Tip:${NC}"
+        if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+            echo -e "  Debian/Ubuntu: ${CYAN}sudo apt install ${missing_tools[*]}${NC}"
+        elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
+            echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install ${missing_tools[*]}${NC}"
+        fi
+    fi
+    echo ""
+}
+
+check_all_dependencies
 
 if [[ "$AUTO_FIX" == true ]]; then
     echo -e "${YELLOW}=== Running in Auto-Fix Mode (--fix enabled) ===${NC}"
@@ -74,36 +184,31 @@ if [[ "$AUTO_FIX" == true ]]; then
     echo -e "${GREEN}✓ Auto-fix completed: Permissions & safety aliases applied.${NC}\n"
 fi
 
-# Helper function to print section headers
-section() {
-    echo -e "\n${BLUE}[$1] $2${NC}"
-}
-
 # Helper function to update security databases before audit
 update_security_databases() {
     echo -e "${YELLOW}--- Updating Security & Audit Tool Databases ---${NC}"
 
-    if command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
+    if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
         echo -n "Updating APT package index... "
-        sudo apt-get update -qq 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
-    elif command -v dnf &> /dev/null; then
+        run_sudo "${TOOL_BIN['apt-get']}" update -qq 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
+    elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
         echo -n "Refreshing DNF repository metadata... "
-        sudo dnf makecache --refresh &>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
+        run_sudo "${TOOL_BIN['dnf']}" makecache --refresh &>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Cached${NC}"
     fi
 
-    if command -v freshclam &> /dev/null; then
+    if [[ "${TOOL_FOUND['freshclam']}" -eq 1 ]]; then
         echo -n "Updating ClamAV virus signatures... "
-        sudo freshclam 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Updated or locked by daemon${NC}"
+        run_sudo "${TOOL_BIN['freshclam']}" 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Updated or locked by daemon${NC}"
     fi
 
-    if command -v rkhunter &> /dev/null; then
+    if [[ "${TOOL_FOUND['rkhunter']}" -eq 1 ]]; then
         echo -n "Updating rkhunter rootkit definitions... "
-        sudo rkhunter --update 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Completed/Skipped${NC}"
+        run_sudo "${TOOL_BIN['rkhunter']}" --update 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Completed/Skipped${NC}"
     fi
 
-    if command -v trivy &> /dev/null; then
+    if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
         echo -n "Updating Trivy vulnerability database... "
-        trivy image --download-db-only 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Up to date${NC}"
+        "${TOOL_BIN['trivy']}" image --download-db-only 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Skipped/Up to date${NC}"
     fi
     echo ""
 }
@@ -120,16 +225,16 @@ clean_history() {
         temp_file=$(mktemp)
         local pattern_regex
         pattern_regex=$(IFS="|"; echo "${SENSITIVE_PATTERNS[*]}")
-        grep -vEia "$pattern_regex" "$file" > "$temp_file"
+        grep -vEia "$pattern_regex" "$file" > "$temp_file" 2>/dev/null
         mv "$temp_file" "$file"
         chmod 600 "$file"
     fi
 }
 
-find "$HOME" -maxdepth 1 \( -name ".zsh_history" -o -name ".bash_history*" \) | while read -r h_file; do
+find "$HOME" -maxdepth 1 \( -name ".zsh_history" -o -name ".bash_history*" \) 2>/dev/null | while read -r h_file; do
     clean_history "$h_file"
 done
-echo -e "${GREEN}✓ History cleaned and permissions set to 600.${NC}"
+log_pass "Shell history cleaned and permissions set to 600."
 
 # 2. Certificate & File Permission Checks
 section "2/20" "Checking Minikube & SSH Certificate Permissions..."
@@ -137,13 +242,12 @@ MINIKUBE_DIR="$HOME/.minikube"
 if [[ -d "$MINIKUBE_DIR" ]]; then
     CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
     if [[ -n "$CERT_FILES" ]]; then
-        echo -e "${RED}Found minikube files with insecure permissions:${NC}"
-        echo "$CERT_FILES"
+        log_warn "Found minikube files with insecure permissions:\n$CERT_FILES"
         echo "Fixing permissions to 600..."
-        find "$MINIKUBE_DIR" -name "*.pem" -exec chmod 600 {} +
-        echo -e "${GREEN}✓ Minikube permissions fixed.${NC}"
+        find "$MINIKUBE_DIR" -name "*.pem" -exec chmod 600 {} + 2>/dev/null
+        log_pass "Minikube permissions fixed."
     else
-        echo -e "${GREEN}✓ Minikube certificate permissions are secure.${NC}"
+        log_pass "Minikube certificate permissions are secure."
     fi
 else
     echo "Minikube directory not found."
@@ -166,9 +270,9 @@ check_ssh_keys_passphrase() {
                     chmod 600 "$key_file" 2>/dev/null
                     ((total_keys_found++))
                     
-                    if ssh-keygen -y -P "" -f "$key_file" &>/dev/null; then
+                    if [[ "${TOOL_FOUND['ssh-keygen']}" -eq 1 ]] && "${TOOL_BIN['ssh-keygen']}" -y -P "" -f "$key_file" &>/dev/null; then
                         ((unencrypted_keys_found++))
-                        echo -e "  - ${RED}⚠️ UNPROTECTED SSH KEY:${NC} User ${CYAN}${username}${NC} -> ${key_file} (${RED}No passphrase set!${NC})"
+                        log_crit "UNPROTECTED SSH KEY: User ${username} -> ${key_file} (No passphrase set!)"
                     else
                         echo -e "  - ${GREEN}✓ Protected SSH Key:${NC} User ${CYAN}${username}${NC} -> $(basename "$key_file")"
                     fi
@@ -178,11 +282,9 @@ check_ssh_keys_passphrase() {
     done < /etc/passwd
 
     if [[ "$total_keys_found" -eq 0 ]]; then
-        echo -e "${GREEN}✓ No SSH private keys found on the system.${NC}"
+        log_pass "No SSH private keys found on the system."
     elif [[ "$unencrypted_keys_found" -eq 0 ]]; then
-        echo -e "${GREEN}✓ All discovered SSH private keys (${total_keys_found}) are protected with passphrases.${NC}"
-    else
-        echo -e "${RED}⚠️ Found ${unencrypted_keys_found} SSH private key(s) without a passphrase! Setting a passphrase is recommended for security.${NC}"
+        log_pass "All discovered SSH private keys (${total_keys_found}) are protected with passphrases."
     fi
 }
 check_ssh_keys_passphrase
@@ -190,30 +292,41 @@ check_ssh_keys_passphrase
 # 3. Application CVE Checks
 section "3/20" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
-if command -v dnf &> /dev/null; then
+if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     for app in "${APPS_TO_CHECK[@]}"; do
         if rpm -q "$app" &> /dev/null; then
             echo -n "Checking $app... "
             SECURITY_INFO=$(dnf updateinfo list security --installed "$app" 2>/dev/null | grep "$app")
             if [[ -n "$SECURITY_INFO" ]]; then
-                echo -e "${RED}VULNERABILITY FOUND!${NC}"
-                echo "$SECURITY_INFO"
+                log_crit "VULNERABILITY FOUND IN $app:\n$SECURITY_INFO"
             else
-                echo -e "${GREEN}OK${NC}"
+                log_pass "Application $app has no known unpatched security alerts in repo."
+            fi
+        fi
+    done
+elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+    for app in "${APPS_TO_CHECK[@]}"; do
+        if dpkg-query -W -f='${Status}' "$app" 2>/dev/null | grep -q "ok installed"; then
+            echo -n "Checking $app... "
+            SECURITY_INFO=$(apt list --upgradable 2>/dev/null | grep -i "$app")
+            if [[ -n "$SECURITY_INFO" ]]; then
+                log_warn "Update / security patch available for $app:\n$SECURITY_INFO"
+            else
+                log_pass "Application $app is up to date."
             fi
         fi
     done
 else
-    echo "DNF package manager not available."
+    echo "No DNF or APT package manager available for CVE checks."
 fi
 
 # 4. SSH Configuration Audit
 section "4/20" "Auditing SSH Daemon Configuration..."
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
-    ROOT_LOGIN=$(sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
-    PASS_AUTH=$(sudo sshd -T 2>/dev/null | grep -i "^passwordauthentication" || echo "passwordauthentication unknown")
-    EMPTY_PASS=$(sudo sshd -T 2>/dev/null | grep -i "^permitemptypasswords" || echo "permitemptypasswords unknown")
+    ROOT_LOGIN=$(run_sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
+    PASS_AUTH=$(run_sudo sshd -T 2>/dev/null | grep -i "^passwordauthentication" || echo "passwordauthentication unknown")
+    EMPTY_PASS=$(run_sudo sshd -T 2>/dev/null | grep -i "^permitemptypasswords" || echo "permitemptypasswords unknown")
 
     echo "Current SSH Settings:"
     echo "  - $ROOT_LOGIN"
@@ -221,10 +334,14 @@ if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
     echo "  - $EMPTY_PASS"
 
     if [[ "$ROOT_LOGIN" =~ "yes" ]]; then
-        echo -e "${YELLOW}⚠️  Recommendation: Set 'PermitRootLogin no' or 'prohibit-password' in /etc/ssh/sshd_config${NC}"
+        log_warn "Recommendation: Set 'PermitRootLogin no' or 'prohibit-password' in /etc/ssh/sshd_config"
+    else
+        log_pass "Root SSH login is restricted."
     fi
     if [[ "$PASS_AUTH" =~ "yes" ]]; then
-        echo -e "${YELLOW}⚠️  Recommendation: Consider disabling PasswordAuthentication in favor of SSH Keys${NC}"
+        log_warn "Recommendation: Consider disabling PasswordAuthentication in favor of SSH Keys"
+    else
+        log_pass "SSH password authentication is disabled."
     fi
 else
     echo "SSHD config not found or sshd not installed."
@@ -232,62 +349,70 @@ fi
 
 # 5. Network & Open Ports Audit
 section "5/20" "Checking Active Listening Ports & Firewall Status..."
-if command -v systemctl &> /dev/null; then
+if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
     if systemctl is-active --quiet firewalld; then
-        echo -e "${GREEN}✓ firewalld is active.${NC}"
+        log_pass "firewalld is active."
     elif systemctl is-active --quiet ufw; then
-        echo -e "${GREEN}✓ ufw is active.${NC}"
+        log_pass "ufw is active."
     else
-        echo -e "${YELLOW}⚠️  Warning: Firewall service (firewalld/ufw) is inactive!${NC}"
+        log_warn "Firewall service (firewalld/ufw) is inactive!"
     fi
 fi
 
-if command -v ss &> /dev/null; then
+if [[ "${TOOL_FOUND['ss']}" -eq 1 ]]; then
     echo -e "${YELLOW}--- Listening Public TCP/UDP Ports ---${NC}"
     LISTEN_PORTS=$(ss -tulpn 2>/dev/null | grep -E '0\.0\.0\.0|::|\*')
     if [[ -n "$LISTEN_PORTS" ]]; then
         echo "$LISTEN_PORTS"
     else
-        echo "No open public listening ports found."
+        log_pass "No open public listening ports found."
     fi
 
-    # Check dangerous/unnecessary protocols
     MDNS_LLMNR=$(ss -tuln 2>/dev/null | grep -E '5353|5355')
     if [[ -n "$MDNS_LLMNR" ]]; then
-        echo -e "${RED}Warning! Active mDNS/LLMNR services found (5353/5355). Disable systemd-resolved LLMNR/MulticastDNS if not needed.${NC}"
+        log_warn "Active mDNS/LLMNR services found (5353/5355). Disable systemd-resolved LLMNR/MulticastDNS if not needed."
     fi
 fi
 
-# 6. Antivirus & Security Daemon Checks (ClamAV & rkhunter)
+# 6. Antivirus & Rootkit Audit (ClamAV / rkhunter)
 section "6/20" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
-if command -v systemctl &> /dev/null && systemctl is-active --quiet clamav-freshclam; then
-    echo -e "${GREEN}✓ clamav-freshclam service is active and managing database updates automatically.${NC}"
-elif command -v freshclam &> /dev/null; then
-    echo "Updating ClamAV database..."
-    sudo freshclam 2>/dev/null || echo "Existing DB will be used or lock acquired by background service."
+if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]] && systemctl is-active --quiet clamav-freshclam; then
+    log_pass "clamav-freshclam service is active."
 fi
 
-if command -v clamscan &> /dev/null; then
+if [[ "${TOOL_FOUND['clamscan']}" -eq 1 ]]; then
     echo "Scanning active system binary paths for malware..."
-    sudo clamscan -r --exclude-dir="^/sys" --exclude-dir="^/dev" --exclude-dir="^/proc" /bin /sbin /usr/bin /usr/sbin 2>/dev/null | grep -E "Infected|Summary|FOUND" || echo -e "${GREEN}✓ ClamAV scan completed: No threats found.${NC}"
+    CLAM_OUT=$(run_sudo "${TOOL_BIN['clamscan']}" -r --exclude-dir="^/sys" --exclude-dir="^/dev" --exclude-dir="^/proc" /bin /sbin /usr/bin /usr/sbin 2>/dev/null | grep -E "Infected|Summary|FOUND")
+    if [[ "$CLAM_OUT" =~ "FOUND" || "$CLAM_OUT" =~ "Infected files: "[1-9] ]]; then
+        log_crit "ClamAV malware threats found!\n$CLAM_OUT"
+    else
+        log_pass "ClamAV scan completed: No threats found."
+    fi
 else
-    echo -e "${YELLOW}ClamAV not installed.${NC}"
+    echo -e "${YELLOW}ClamAV (clamscan) not installed.${NC}"
 fi
 
-if command -v rkhunter &> /dev/null; then
+if [[ "${TOOL_FOUND['rkhunter']}" -eq 1 ]]; then
     echo "Running Rootkit Detection (rkhunter)..."
-    sudo rkhunter --check --sk --quiet 2>/dev/null
-    echo -e "${GREEN}✓ rkhunter check completed.${NC}"
+    run_sudo "${TOOL_BIN['rkhunter']}" --check --sk --quiet 2>/dev/null
+    log_pass "rkhunter check completed."
 else
     echo -e "${YELLOW}rkhunter not installed.${NC}"
 fi
 
-# 7. Filesystem & Container Security Scanning (Trivy)
-section "7/20" "Trivy Code & Filesystem Security Scan..."
-if command -v trivy &> /dev/null; then
-    trivy fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory"
+# 7. Filesystem, Container & Lynis Security Scanning
+section "7/20" "Filesystem, Container & Lynis Security Audit..."
+if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
+    "${TOOL_BIN['trivy']}" fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory" 2>/dev/null
 else
-    echo -e "${YELLOW}Trivy not installed. (Install trivy for automated vulnerability scanning of code/containers).${NC}"
+    echo -e "${YELLOW}Trivy not installed. (Install trivy for vulnerability scanning of code/containers).${NC}"
+fi
+
+if [[ "${TOOL_FOUND['lynis']}" -eq 1 ]]; then
+    echo -e "\n${CYAN}Running Lynis System Audit Summary...${NC}"
+    run_sudo "${TOOL_BIN['lynis']}" audit system --quick --no-colors 2>/dev/null | grep -E "Hardening index|Warnings|Suggestions"
+else
+    echo -e "${YELLOW}Lynis security auditor not installed. (Install lynis for deep security scoring).${NC}"
 fi
 
 # 8. System Log & Auth Audit
@@ -298,28 +423,25 @@ parse_security_logs() {
 
     echo -e "${YELLOW}--- Scanning System Logs for Security Anomaly Indicators ---${NC}"
 
-    # 1. Systemd Journal Analysis
-    if command -v journalctl &> /dev/null; then
+    if [[ "${TOOL_FOUND['journalctl']}" -eq 1 ]]; then
         echo -e "${CYAN}Scanning systemd journal (last 24h)...${NC}"
         local journal_matches
-        journal_matches=$(journalctl --since "24 hours ago" -p warning..emerg --grep="$pattern_regex" --no-pager -n 15 2>/dev/null)
+        journal_matches=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" -p warning..emerg --grep="$pattern_regex" --no-pager -n 15 2>/dev/null)
         
         if [[ -n "$journal_matches" ]]; then
-            echo -e "${RED}⚠️ Found suspicious entries in systemd journal:${NC}"
-            echo "$journal_matches"
+            log_warn "Suspicious entries found in systemd journal:\n$journal_matches"
         else
-            echo -e "${GREEN}✓ No high-severity security anomalies found in systemd journal (last 24h).${NC}"
+            log_pass "No high-severity security anomalies found in systemd journal (last 24h)."
         fi
 
         local failed_count
-        failed_count=$(journalctl --since "24 hours ago" --grep="failed|invalid" --no-pager 2>/dev/null | wc -l)
+        failed_count=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" --grep="failed|invalid" --no-pager 2>/dev/null | wc -l)
         echo -e "Failed authentication events (24h): ${CYAN}${failed_count}${NC}"
         if [[ "$failed_count" -gt 20 ]]; then
-            echo -e "${RED}⚠️ High number of failed auth attempts detected (${failed_count})! Possible brute-force attack.${NC}"
+            log_warn "High number of failed auth attempts detected (${failed_count})! Possible brute-force attack."
         fi
     fi
 
-    # 2. Traditional Log Files Scan (/var/log/auth.log, /var/log/secure, /var/log/syslog)
     local target_logs=()
     [[ -f "/var/log/auth.log" ]] && target_logs+=("/var/log/auth.log")
     [[ -f "/var/log/secure" ]] && target_logs+=("/var/log/secure")
@@ -330,23 +452,22 @@ parse_security_logs() {
         echo -e "\n${CYAN}Scanning security log files (${target_logs[*]})...${NC}"
         for logfile in "${target_logs[@]}"; do
             local file_matches
-            file_matches=$(sudo grep -Ei "$pattern_regex" "$logfile" 2>/dev/null | tail -n 10)
+            file_matches=$(run_sudo grep -Ei "$pattern_regex" "$logfile" 2>/dev/null | tail -n 10)
             if [[ -n "$file_matches" ]]; then
-                echo -e "${YELLOW}Recent suspicious entries in ${logfile}:${NC}"
-                echo "$file_matches"
+                log_warn "Recent suspicious entries in ${logfile}:\n$file_matches"
             else
-                echo -e "${GREEN}✓ No critical security entries found in ${logfile}.${NC}"
+                log_pass "No critical security entries found in ${logfile}."
             fi
         done
     fi
 
     echo -e "\n${YELLOW}--- Recent Sudo Usage & Privilege Escalation ---${NC}"
     if [[ -f "/var/log/secure" ]]; then
-        sudo grep "sudo" /var/log/secure 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/secure."
+        run_sudo grep "sudo" /var/log/secure 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/secure."
     elif [[ -f "/var/log/auth.log" ]]; then
-        sudo grep "sudo" /var/log/auth.log 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/auth.log."
-    else
-        sudo journalctl _COMM=sudo -n 10 --no-pager 2>/dev/null || echo "No sudo records found in journal."
+        run_sudo grep "sudo" /var/log/auth.log 2>/dev/null | tail -n 10 || echo "No sudo records found in /var/log/auth.log."
+    elif [[ "${TOOL_FOUND['journalctl']}" -eq 1 ]]; then
+        run_sudo "${TOOL_BIN['journalctl']}" _COMM=sudo -n 10 --no-pager 2>/dev/null || echo "No sudo records found in journal."
     fi
 }
 
@@ -369,39 +490,46 @@ while read -r line; do
     use_pct=${use_pct_str%\%}
 
     if [[ "$use_pct" =~ ^[0-9]+$ ]] && [[ "$use_pct" -ge 80 ]]; then
-        HIGH_DISK_ALERT+="$(echo -e "  - ${RED}WARNING! Partition ${mount} (${fs}) is ${use_pct}% full!${NC} (Free space: ${GREEN}${avail}${NC} available out of ${size}, Used: ${used})")\n"
+        HIGH_DISK_ALERT+="Partition ${mount} (${fs}) is ${use_pct}% full! (Free: ${avail} / ${size}, Used: ${used})\n"
     fi
 done < <(df -h -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | awk 'NR>1')
 
 if [[ -n "$HIGH_DISK_ALERT" ]]; then
-    echo -e "\n${RED}⚠️ High disk usage detected (>= 80% occupied):${NC}"
-    echo -e "$HIGH_DISK_ALERT"
+    log_warn "High disk usage detected (>= 80% occupied):\n$HIGH_DISK_ALERT"
 else
-    echo -e "\n${GREEN}✓ All disk partitions have sufficient free space (< 80% used).${NC}"
+    log_pass "All disk partitions have sufficient free space (< 80% used)."
 fi
 
 echo -e "\n${YELLOW}--- Systemd Failed Services ---${NC}"
-FAILED_SERVICES=$(systemctl --failed --no-legend 2>/dev/null)
-if [[ -n "$FAILED_SERVICES" ]]; then
-    echo -e "${RED}Found failed systemd services:${NC}"
-    echo "$FAILED_SERVICES"
-else
-    echo -e "${GREEN}✓ No failed systemd services.${NC}"
+if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
+    FAILED_SERVICES=$(systemctl --failed --no-legend 2>/dev/null)
+    if [[ -n "$FAILED_SERVICES" ]]; then
+        log_warn "Found failed systemd services:\n$FAILED_SERVICES"
+    else
+        log_pass "No failed systemd services."
+    fi
 fi
 
 echo -e "\n${YELLOW}--- Systemd Journal Disk Usage ---${NC}"
-if command -v journalctl &> /dev/null; then
-    journalctl --disk-usage
+if [[ "${TOOL_FOUND['journalctl']}" -eq 1 ]]; then
+    "${TOOL_BIN['journalctl']}" --disk-usage
     echo "Tip: Run 'sudo journalctl --vacuum-time=2weeks' or '--vacuum-size=500M' if journal size is too large."
 fi
 
-echo -e "\n${YELLOW}--- DNF Package Cache & Unused Packages ---${NC}"
-if command -v dnf &> /dev/null; then
+echo -e "\n${YELLOW}--- Package Cache & Unused Packages ---${NC}"
+if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     UNNEEDED=$(dnf autoremove --dry-run 2>/dev/null | grep -E "Removing:" | head -n 5)
     if [[ -n "$UNNEEDED" ]]; then
-        echo -e "${YELLOW}Orphaned/unused packages detected. Consider running 'sudo dnf autoremove'.${NC}"
+        log_warn "Orphaned/unused packages detected. Consider running 'sudo dnf autoremove'."
     else
-        echo -e "${GREEN}✓ Package database clean.${NC}"
+        log_pass "Package database clean."
+    fi
+elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+    UNNEEDED=$(apt-get autoremove --dry-run 2>/dev/null | grep -E "^Remv " | head -n 5)
+    if [[ -n "$UNNEEDED" ]]; then
+        log_warn "Orphaned/unused packages detected. Consider running 'sudo apt autoremove'."
+    else
+        log_pass "Package database clean."
     fi
 fi
 
@@ -410,9 +538,9 @@ section "10/20" "Privilege & Security Misconfiguration Audit..."
 echo -e "${YELLOW}--- Checking for Non-Root Accounts with UID 0 ---${NC}"
 UID_ZERO=$(awk -F: '($3 == "0" && $1 != "root") { print $1 }' /etc/passwd)
 if [[ -n "$UID_ZERO" ]]; then
-    echo -e "${RED}CRITICAL! Non-root users with UID 0 found:${NC} $UID_ZERO"
+    log_crit "Non-root users with UID 0 found: $UID_ZERO"
 else
-    echo -e "${GREEN}✓ Only root user has UID 0.${NC}"
+    log_pass "Only root user has UID 0."
 fi
 
 echo -e "\n${YELLOW}--- Accounts with Console / Interactive Shell Access ---${NC}"
@@ -432,7 +560,7 @@ check_console_users() {
         local pass_status="Unknown"
         if command -v passwd &>/dev/null; then
             local p_info
-            p_info=$(sudo passwd -S "$username" 2>/dev/null | awk '{print $2}')
+            p_info=$(run_sudo passwd -S "$username" 2>/dev/null | awk '{print $2}')
             case "$p_info" in
                 L|LK) pass_status="${YELLOW}Locked${NC}" ;;
                 P|PS) pass_status="${GREEN}Password Set${NC}" ;;
@@ -445,7 +573,7 @@ check_console_users() {
         echo -e "    Home: ${home} | Sudo Privileges: ${is_sudo} | Password Status: ${pass_status}"
 
         if [[ "$p_info" == "NP" ]]; then
-            echo -e "    ${RED}⚠️ SECURITY ALERT: User '${username}' has NO password set!${NC}"
+            log_crit "User '${username}' has NO password set!"
         fi
 
     done < /etc/passwd
@@ -457,18 +585,15 @@ section "11/20" "Auditing Repository Kernel Updates & Recommended Security Packa
 RUNNING_KERNEL=$(uname -r)
 echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
 
-if command -v dnf &> /dev/null || command -v yum &> /dev/null; then
-    PKG_MGR="dnf"
-    command -v dnf &> /dev/null || PKG_MGR="yum"
-    echo -e "Detected package manager: ${BLUE}${PKG_MGR}${NC} (RedHat/Fedora family)"
+if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
+    echo -e "Detected package manager: ${BLUE}dnf${NC} (RedHat/Fedora family)"
 
     echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
-    KERNEL_UPDATES=$($PKG_MGR check-update kernel kernel-core kernel-modules 2>/dev/null | grep -E '^kernel(-core|-modules)?\.')
+    KERNEL_UPDATES=$(dnf check-update kernel kernel-core kernel-modules 2>/dev/null | grep -E '^kernel(-core|-modules)?\.')
     if [[ -n "$KERNEL_UPDATES" ]]; then
-        echo -e "${RED}⚠️ New kernel update available in repository:${NC}"
-        echo "$KERNEL_UPDATES"
+        log_warn "New kernel update available in repository:\n$KERNEL_UPDATES"
     else
-        echo -e "${GREEN}✓ Kernel is up to date in repository.${NC}"
+        log_pass "Kernel is up to date in repository."
     fi
 
     LATEST_INSTALLED_KERNEL=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | tail -n 1)
@@ -476,14 +601,14 @@ if command -v dnf &> /dev/null || command -v yum &> /dev/null; then
         LATEST_INSTALLED_KERNEL=$(rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | tail -n 1)
     fi
     if [[ -n "$LATEST_INSTALLED_KERNEL" && "$RUNNING_KERNEL" != "$LATEST_INSTALLED_KERNEL"* ]]; then
-        echo -e "${YELLOW}⚠️ System reboot required! Running kernel ($RUNNING_KERNEL) differs from installed ($LATEST_INSTALLED_KERNEL).${NC}"
+        log_warn "System reboot required! Running kernel ($RUNNING_KERNEL) differs from installed ($LATEST_INSTALLED_KERNEL)."
     fi
 
     echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
     RECOMMENDED_PKGS=("fail2ban" "firewalld" "audit" "clamav" "rkhunter" "trivy" "policycoreutils" "crypto-policies")
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if rpm -q "$pkg" &> /dev/null; then
-            PKG_UPDATE=$($PKG_MGR check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\.")
+            PKG_UPDATE=$(dnf check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\.")
             if [[ -n "$PKG_UPDATE" ]]; then
                 echo -e "  - $pkg: ${GREEN}Installed${NC} | ${RED}Update Available in Repo${NC}"
             else
@@ -494,20 +619,19 @@ if command -v dnf &> /dev/null || command -v yum &> /dev/null; then
         fi
     done
 
-elif command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
+elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     echo -e "Detected package manager: ${BLUE}apt${NC} (Debian family)"
 
     echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
     KERNEL_UPDATES=$(apt list --upgradable 2>/dev/null | grep -E '^linux-(image|headers|generic|amd64|arm64)')
     if [[ -n "$KERNEL_UPDATES" ]]; then
-        echo -e "${RED}⚠️ New kernel update available in repository:${NC}"
-        echo "$KERNEL_UPDATES"
+        log_warn "New kernel update available in repository:\n$KERNEL_UPDATES"
     else
-        echo -e "${GREEN}✓ Kernel is up to date in repository.${NC}"
+        log_pass "Kernel is up to date in repository."
     fi
 
     if [[ -f "/var/run/reboot-required" ]]; then
-        echo -e "${YELLOW}⚠️ System reboot required! (/var/run/reboot-required exists)${NC}"
+        log_warn "System reboot required! (/var/run/reboot-required exists)"
         if [[ -f "/var/run/reboot-required.pkgs" ]]; then
             echo "Packages requiring reboot:"
             cat /var/run/reboot-required.pkgs | sed 's/^/  - /'
@@ -515,7 +639,7 @@ elif command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
     fi
 
     echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
-    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "rkhunter" "trivy" "needrestart")
+    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "rkhunter" "trivy" "needrestart" "debsums" "lynis")
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
             PKG_UPDATE=$(apt list --upgradable 2>/dev/null | grep -E "^${pkg}/")
@@ -529,6 +653,10 @@ elif command -v apt-get &> /dev/null || command -v apt &> /dev/null; then
         fi
     done
 
+    if [[ "${TOOL_FOUND['needrestart']}" -eq 1 ]]; then
+        echo -e "\n${CYAN}Needrestart Check (Services needing restart):${NC}"
+        run_sudo "${TOOL_BIN['needrestart']}" -b 2>/dev/null | grep 'NEEDRESTART-SVC' || echo -e "${GREEN}✓ No background services require restart.${NC}"
+    fi
 else
     echo -e "${YELLOW}Unsupported package manager. Skipping repository kernel & package audit.${NC}"
 fi
@@ -551,15 +679,14 @@ audit_suspicious_processes() {
             user=$(ps -p "$pid" -o user= 2>/dev/null)
             local cmd
             cmd=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
-            deleted_procs+="  - ${RED}PID ${pid}${NC} (User: ${user}) -> ${target}\n    Command: ${cmd}\n"
+            deleted_procs+="PID ${pid} (User: ${user}) -> ${target} [Cmd: ${cmd}]\n"
             ((threats_found++))
         fi
     done
     if [[ -n "$deleted_procs" ]]; then
-        echo -e "${RED}⚠️ CRITICAL: Processes executing deleted binary files detected!${NC}"
-        echo -e "$deleted_procs"
+        log_crit "Processes executing deleted binary files detected!\n$deleted_procs"
     else
-        echo -e "${GREEN}✓ No processes running deleted binaries found.${NC}"
+        log_pass "No processes running deleted binaries found."
     fi
 
     echo -e "\n${YELLOW}--- 2. Checking for Processes Executing from Temporary Directories (/tmp, /dev/shm) ---${NC}"
@@ -574,15 +701,14 @@ audit_suspicious_processes() {
             user=$(ps -p "$pid" -o user= 2>/dev/null)
             local cmd
             cmd=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
-            temp_procs+="  - ${RED}PID ${pid}${NC} (User: ${user}) -> ${target}\n    Command: ${cmd}\n"
+            temp_procs+="PID ${pid} (User: ${user}) -> ${target} [Cmd: ${cmd}]\n"
             ((threats_found++))
         fi
     done
     if [[ -n "$temp_procs" ]]; then
-        echo -e "${RED}⚠️ WARNING: Processes running from temporary/volatile directories found:${NC}"
-        echo -e "$temp_procs"
+        log_warn "Processes running from temporary/volatile directories found:\n$temp_procs"
     else
-        echo -e "${GREEN}✓ No processes executing from /tmp, /var/tmp, or /dev/shm.${NC}"
+        log_pass "No processes executing from /tmp, /var/tmp, or /dev/shm."
     fi
 
     echo -e "\n${YELLOW}--- 3. Checking for Known Miner & Suspicious Tool Signatures ---${NC}"
@@ -590,11 +716,10 @@ audit_suspicious_processes() {
     local suspicious_procs
     suspicious_procs=$(ps aux 2>/dev/null | grep -Ei "$miner_pattern" | grep -vE "grep|system-audit.sh")
     if [[ -n "$suspicious_procs" ]]; then
-        echo -e "${RED}⚠️ ALERT: Known suspicious miner or scanning tools detected:${NC}"
-        echo "$suspicious_procs"
+        log_crit "Known suspicious miner or scanning tools detected:\n$suspicious_procs"
         ((threats_found++))
     else
-        echo -e "${GREEN}✓ No known miner or scanning tool signatures detected.${NC}"
+        log_pass "No known miner or scanning tool signatures detected."
     fi
 
     echo -e "\n${YELLOW}--- 4. Checking for Potential Reverse Shell Patterns ---${NC}"
@@ -602,11 +727,10 @@ audit_suspicious_processes() {
     local revshell_procs
     revshell_procs=$(ps aux 2>/dev/null | grep -Ei "$revshell_pattern" | grep -vE "grep|system-audit.sh")
     if [[ -n "$revshell_procs" ]]; then
-        echo -e "${RED}⚠️ ALERT: Potential reverse shell processes detected:${NC}"
-        echo "$revshell_procs"
+        log_crit "Potential reverse shell processes detected:\n$revshell_procs"
         ((threats_found++))
     else
-        echo -e "${GREEN}✓ No reverse shell command patterns detected.${NC}"
+        log_pass "No reverse shell command patterns detected."
     fi
 
     echo -e "\n${YELLOW}--- 5. Top CPU & RAM Consuming Processes ---${NC}"
@@ -614,9 +738,9 @@ audit_suspicious_processes() {
     local high_cpu
     high_cpu=$(ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | awk 'NR>1 && $3 > 70.0 {print $0}')
     if [[ -n "$high_cpu" ]]; then
-        echo -e "${YELLOW}$high_cpu${NC}"
+        log_warn "Processes consuming high CPU (>70%):\n$high_cpu"
     else
-        echo -e "${GREEN}✓ No processes consuming excessive CPU (>70%).${NC}"
+        log_pass "No processes consuming excessive CPU (>70%)."
     fi
 
     echo -e "${CYAN}Highest RAM Consuming Processes (Top 5):${NC}"
@@ -652,21 +776,20 @@ audit_shell_configs_and_aliases() {
             local found_suspicious
             found_suspicious=$(grep -Ei "$hijacking_patterns" "$rc_path" 2>/dev/null | grep -vE "alias ls='ls --color|alias ll=|alias la=")
             if [[ -n "$found_suspicious" ]]; then
-                suspicious_findings+="  - ${RED}Suspicious alias in ${rc_path}:${NC}\n$found_suspicious\n"
+                suspicious_findings+="Suspicious alias in ${rc_path}:\n$found_suspicious\n"
             fi
 
             local found_exec
             found_exec=$(grep -Ei "$dangerous_exec_patterns" "$rc_path" 2>/dev/null)
             if [[ -n "$found_exec" ]]; then
-                suspicious_findings+="  - ${RED}Dangerous execution pattern in ${rc_path}:${NC}\n$found_exec\n"
+                suspicious_findings+="Dangerous execution pattern in ${rc_path}:\n$found_exec\n"
             fi
         done
 
         if [[ -n "$suspicious_findings" ]]; then
-            echo -e "${RED}⚠️ Suspicious aliases or remote execution patterns detected:${NC}"
-            echo -e "$suspicious_findings"
+            log_warn "Suspicious aliases or remote execution patterns detected for ${username}:\n$suspicious_findings"
         else
-            echo -e "${GREEN}✓ No suspicious alias hijacking or remote code execution patterns found.${NC}"
+            log_pass "No suspicious alias hijacking or remote code execution patterns found for ${username}."
         fi
 
         local has_rm_safe=0
@@ -681,27 +804,23 @@ audit_shell_configs_and_aliases() {
             grep -Eq "preserve-root" "$rc_path" 2>/dev/null && has_preserve_root=1
         done
 
-        echo -e "${YELLOW}Safety Aliases & Protection Recommendations:${NC}"
+        echo -e "${YELLOW}Safety Aliases & Protection Recommendations for ${username}:${NC}"
         if [[ "$has_rm_safe" -eq 1 ]]; then
             echo -e "  - 'rm' safety alias: ${GREEN}Enabled${NC}"
         else
-            echo -e "  - 'rm' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias rm='rm -i'${NC} to ${user_rc_found[0]} to prevent accidental 'rm -rf' data loss."
+            log_warn "Missing 'rm' safety alias for ${username} -> Add alias rm='rm -i' to ${user_rc_found[0]}"
         fi
 
         if [[ "$has_cp_safe" -eq 1 ]]; then
             echo -e "  - 'cp' safety alias: ${GREEN}Enabled${NC}"
         else
-            echo -e "  - 'cp' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias cp='cp -i'${NC} to ${user_rc_found[0]} to prevent overwriting files."
+            log_warn "Missing 'cp' safety alias for ${username} -> Add alias cp='cp -i' to ${user_rc_found[0]}"
         fi
 
         if [[ "$has_mv_safe" -eq 1 ]]; then
             echo -e "  - 'mv' safety alias: ${GREEN}Enabled${NC}"
         else
-            echo -e "  - 'mv' safety alias: ${YELLOW}Missing${NC} -> Recommendation: Add ${CYAN}alias mv='mv -i'${NC} to ${user_rc_found[0]} to prevent overwriting files."
-        fi
-
-        if [[ "$has_preserve_root" -eq 0 ]]; then
-            echo -e "  - Extra safety recommendation: Add ${CYAN}alias chown='chown --preserve-root'${NC} and ${CYAN}alias chmod='chmod --preserve-root'${NC} to ${user_rc_found[0]}"
+            log_warn "Missing 'mv' safety alias for ${username} -> Add alias mv='mv -i' to ${user_rc_found[0]}"
         fi
 
     done < /etc/passwd
@@ -716,10 +835,9 @@ audit_suid_files() {
     local suspicious_suid
     suspicious_suid=$(find /tmp /var/tmp /dev/shm /home -perm -4000 -o -perm -2000 2>/dev/null)
     if [[ -n "$suspicious_suid" ]]; then
-        echo -e "${RED}⚠️ CRITICAL! SUID/SGID files found in non-standard/writable paths:${NC}"
-        echo "$suspicious_suid"
+        log_crit "SUID/SGID files found in non-standard/writable paths:\n$suspicious_suid"
     else
-        echo -e "${GREEN}✓ No SUID/SGID files found in volatile/user paths (/tmp, /dev/shm, /home).${NC}"
+        log_pass "No SUID/SGID files found in volatile/user paths (/tmp, /dev/shm, /home)."
     fi
 
     echo -e "\n${YELLOW}--- System SUID Executables Count ---${NC}"
@@ -748,9 +866,10 @@ audit_persistence() {
     fi
 
     echo -e "\n${YELLOW}--- Active Systemd Timers ---${NC}"
-    if command -v systemctl &>/dev/null; then
+    if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
         systemctl list-timers --no-pager --no-legend 2>/dev/null | head -n 10
     fi
+    log_pass "Persistence mechanisms audited."
 }
 audit_persistence
 
@@ -767,14 +886,16 @@ audit_authorized_keys() {
                 ((keys_count += key_num))
                 echo -e "  - User ${CYAN}${username}${NC}: ${key_num} authorized key(s) in ${auth_keys}"
                 if [[ "$username" == "root" ]]; then
-                    echo -e "    ${RED}⚠️ Warning: Root account has SSH authorized keys configured!${NC}"
+                    log_warn "Root account has SSH authorized keys configured!"
                 fi
             fi
         fi
     done < /etc/passwd
 
     if [[ "$keys_count" -eq 0 ]]; then
-        echo -e "${GREEN}✓ No authorized_keys files found.${NC}"
+        log_pass "No authorized_keys files found."
+    else
+        log_pass "Discovered ${keys_count} SSH authorized key(s) across user accounts."
     fi
 }
 audit_authorized_keys
@@ -790,15 +911,18 @@ audit_container_security() {
         echo "Docker socket (/var/run/docker.sock) not active."
     fi
 
-    if command -v docker &>/dev/null && docker ps &>/dev/null; then
+    if [[ "${TOOL_FOUND['docker']}" -eq 1 ]] && docker ps &>/dev/null; then
         echo -e "\n${YELLOW}--- Running Docker Containers ---${NC}"
         local priv_containers
         priv_containers=$(docker ps --quiet | xargs docker inspect --format '{{ .Id }}: Privileged={{ .HostConfig.Privileged }}' 2>/dev/null | grep 'Privileged=true')
         if [[ -n "$priv_containers" ]]; then
-            echo -e "${RED}⚠️ Privileged containers detected:${NC}\n$priv_containers"
+            log_warn "Privileged containers detected:\n$priv_containers"
         else
-            echo -e "${GREEN}✓ No privileged Docker containers running.${NC}"
+            log_pass "No privileged Docker containers running."
         fi
+    elif [[ "${TOOL_FOUND['podman']}" -eq 1 ]] && podman ps &>/dev/null; then
+        echo -e "\n${YELLOW}--- Running Podman Containers ---${NC}"
+        log_pass "Podman container daemon verified."
     fi
 }
 audit_container_security
@@ -806,18 +930,20 @@ audit_container_security
 # 18. Kernel Security Hardening (Sysctl Parameters Audit)
 section "18/20" "Auditing Kernel Security Hardening (sysctl Parameters)..."
 audit_kernel_hardening() {
-    local SYSCTL_BIN="sysctl"
-    command -v sysctl &>/dev/null || SYSCTL_BIN="/usr/sbin/sysctl"
+    local sysctl_cmd="${TOOL_BIN['sysctl']}"
+    if [[ -z "$sysctl_cmd" ]]; then
+        sysctl_cmd="/sbin/sysctl"
+    fi
 
     check_sysctl() {
         local param="$1"
         local expected="$2"
         local val
-        val=$($SYSCTL_BIN -n "$param" 2>/dev/null)
+        val=$("$sysctl_cmd" -n "$param" 2>/dev/null)
         if [[ "$val" == "$expected" ]]; then
-            echo -e "  - ${param}: ${GREEN}${val}${NC} (Secure)"
+            log_pass "${param}: ${val} (Secure)"
         else
-            echo -e "  - ${param}: ${YELLOW}${val}${NC} (Recommended: ${expected})"
+            log_warn "${param}: ${val} (Recommended: ${expected})"
         fi
     }
 
@@ -845,7 +971,7 @@ audit_dns_hosts() {
             echo -e "${CYAN}Custom /etc/hosts entries:${NC}"
             echo "$custom_hosts"
         else
-            echo -e "${GREEN}✓ No unusual custom entries in /etc/hosts.${NC}"
+            log_pass "No unusual custom entries in /etc/hosts."
         fi
     fi
 }
@@ -871,9 +997,9 @@ audit_wifi_and_network_hosts() {
     fi
 
     echo -e "\n${YELLOW}--- 2. Wi-Fi Networks & Connected Access Point Security ---${NC}"
-    if command -v nmcli &>/dev/null; then
+    if [[ "${TOOL_FOUND['nmcli']}" -eq 1 ]]; then
         local connected_wifi
-        connected_wifi=$(nmcli -f IN-USE,SSID,BSSID,RATE,SIGNAL,SECURITY dev wifi 2>/dev/null | grep '^\*')
+        connected_wifi=$("${TOOL_BIN['nmcli']}" -f IN-USE,SSID,BSSID,RATE,SIGNAL,SECURITY dev wifi 2>/dev/null | grep '^\*')
         if [[ -n "$connected_wifi" ]]; then
             echo -e "${CYAN}Currently Connected Wi-Fi Network:${NC}"
             echo "$connected_wifi"
@@ -882,13 +1008,13 @@ audit_wifi_and_network_hosts() {
             wifi_sec=$(echo "$connected_wifi" | awk '{print $NF}')
             echo -n "Connected Security Protocol Assessment: "
             if [[ "$wifi_sec" =~ OPEN|NONE ]]; then
-                echo -e "${RED}⚠️ CRITICAL SECURITY RISK! Connected to an UNENCRYPTED (OPEN) Wi-Fi network! Traffic can be intercepted.${NC}"
+                log_crit "Connected to an UNENCRYPTED (OPEN) Wi-Fi network! Traffic can be intercepted."
             elif [[ "$wifi_sec" =~ WEP|WPA1 ]]; then
-                echo -e "${RED}⚠️ WARNING! Connected to obsolete/vulnerable ${wifi_sec} network.${NC}"
+                log_warn "Connected to obsolete/vulnerable ${wifi_sec} network."
             elif [[ "$wifi_sec" =~ WPA3 ]]; then
-                echo -e "${GREEN}✓ WPA3 Security (Strongest modern encryption standard).${NC}"
+                log_pass "WPA3 Security (Strongest modern encryption standard)."
             elif [[ "$wifi_sec" =~ WPA2 ]]; then
-                echo -e "${GREEN}✓ WPA2 Security (Secure standard).${NC}"
+                log_pass "WPA2 Security (Secure standard)."
             else
                 echo -e "${CYAN}${wifi_sec}${NC}"
             fi
@@ -898,21 +1024,19 @@ audit_wifi_and_network_hosts() {
 
         echo -e "\n${CYAN}Nearby Wi-Fi Access Points in Range:${NC}"
         local wifi_list
-        wifi_list=$(nmcli -f SSID,BSSID,SIGNAL,SECURITY dev wifi 2>/dev/null | head -n 12)
+        wifi_list=$("${TOOL_BIN['nmcli']}" -f SSID,BSSID,SIGNAL,SECURITY dev wifi 2>/dev/null | head -n 12)
         if [[ -n "$wifi_list" ]]; then
             echo "$wifi_list"
             local open_nearby
             open_nearby=$(echo "$wifi_list" | grep -Ei 'OPEN|NONE')
             if [[ -n "$open_nearby" ]]; then
-                echo -e "${YELLOW}⚠️ Warning: Open/unencrypted Wi-Fi networks detected nearby!${NC}"
+                log_warn "Open/unencrypted Wi-Fi networks detected nearby!"
             fi
         else
             echo "No nearby Wi-Fi networks found or Wi-Fi adapter disabled."
         fi
-    elif command -v iwconfig &>/dev/null; then
-        iwconfig 2>/dev/null | grep -E 'ESSID|Access Point|Encryption'
     else
-        echo -e "${YELLOW}nmcli / iwconfig not available for Wi-Fi scanning.${NC}"
+        echo -e "${YELLOW}nmcli not available for Wi-Fi scanning.${NC}"
     fi
 
     echo -e "\n${YELLOW}--- 3. Local Subnet Active Hosts Discovery ---${NC}"
@@ -922,14 +1046,14 @@ audit_wifi_and_network_hosts() {
         local subnet_cidr="${subnet_prefix}.0/24"
         
         echo -e "Scanning local subnet (${CYAN}${subnet_cidr}${NC})..."
-        if command -v nmap &>/dev/null; then
+        if [[ "${TOOL_FOUND['nmap']}" -eq 1 ]]; then
             local nmap_hosts
-            nmap_hosts=$(nmap -sn --host-timeout 3s "$subnet_cidr" 2>/dev/null | grep -E "Nmap scan report|Host is up")
+            nmap_hosts=$("${TOOL_BIN['nmap']}" -sn --host-timeout 3s "$subnet_cidr" 2>/dev/null | grep -E "Nmap scan report|Host is up")
             if [[ -n "$nmap_hosts" ]]; then
                 echo "$nmap_hosts"
                 local host_count
                 host_count=$(echo "$nmap_hosts" | grep -c "Nmap scan report")
-                echo -e "${GREEN}Total active hosts discovered on local subnet: ${host_count}${NC}"
+                log_pass "Total active hosts discovered on local subnet: ${host_count}"
             fi
         else
             echo -e "${CYAN}Active neighbors (ARP / IP Cache):${NC}"
@@ -939,9 +1063,48 @@ audit_wifi_and_network_hosts() {
 }
 audit_wifi_and_network_hosts
 
-echo -e "\n${CYAN}=====================================================${NC}"
-echo -e "${GREEN}=== Audit Completed Successfully! ===${NC}"
-if [[ "$GENERATE_REPORT" == true ]]; then
-    echo -e "${GREEN}Report saved to: ${REPORT_FILE}${NC}"
-fi
-echo -e "${CYAN}=====================================================${NC}"
+# --- Executive Audit Summary Scorecard ---
+print_scorecard() {
+    echo -e "\n${CYAN}=====================================================${NC}"
+    echo -e "${CYAN}===           AUDIT EXECUTIVE SCORECARD           ===${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+
+    local score=100
+    if [[ $TOTAL_CHECKS -gt 0 ]]; then
+        score=$(( (PASSED_COUNT * 100) / TOTAL_CHECKS ))
+    fi
+
+    printf "  %-30s : %d\n" "Total Security Checks" "$TOTAL_CHECKS"
+    printf "  %-30s : ${GREEN}%d${NC}\n" "Checks Passed" "$PASSED_COUNT"
+    printf "  %-30s : ${YELLOW}%d${NC}\n" "Warnings / Suggestions" "$WARNING_COUNT"
+    printf "  %-30s : ${RED}%d${NC}\n" "Critical Vulnerabilities" "$CRITICAL_COUNT"
+    echo -e "-----------------------------------------------------"
+
+    # Build visual progress bar
+    local bar_width=20
+    local filled=$(( (score * bar_width) / 100 ))
+    local empty=$(( bar_width - filled ))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="#"; done
+    for ((i=0; i<empty; i++)); do bar+="-"; done
+
+    if [[ $score -ge 80 ]]; then
+        echo -e "  Overall Security Score        : ${GREEN}${score}% [${bar}]${NC}"
+    elif [[ $score -ge 50 ]]; then
+        echo -e "  Overall Security Score        : ${YELLOW}${score}% [${bar}]${NC}"
+    else
+        echo -e "  Overall Security Score        : ${RED}${score}% [${bar}]${NC}"
+    fi
+
+    echo -e "${CYAN}=====================================================${NC}"
+    if [[ "$GENERATE_REPORT" == true ]]; then
+        echo -e "${GREEN}✓ Audit Completed! Detailed report saved to:${NC}"
+        echo -e "  ${CYAN}${REPORT_FILE}${NC}"
+    else
+        echo -e "${GREEN}✓ Audit Completed Successfully!${NC}"
+        echo -e "  Tip: Use ${CYAN}--report${NC} to export a clean Markdown report."
+    fi
+    echo -e "${CYAN}=====================================================${NC}"
+}
+
+print_scorecard
