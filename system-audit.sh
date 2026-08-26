@@ -23,17 +23,49 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# Configuration & Execution Modes (Sequential Auto-Audit & Remediation)
+AUTO_FIX=true
+CLEAN_CACHE=true
+GENERATE_REPORT=true
+AUTO_RESTART_SERVICES=true
+INSTALL_MISSING_PKGS=false
+REPORT_DIR="$HOME/Labolatory/bash/reports"
+
+# CLI Arguments Parser
+for arg in "$@"; do
+    case "$arg" in
+        --restart-services|-r)
+            AUTO_RESTART_SERVICES=true
+            ;;
+        --no-restart-services)
+            AUTO_RESTART_SERVICES=false
+            ;;
+        --install-packages|-i)
+            INSTALL_MISSING_PKGS=true
+            ;;
+        --no-fix)
+            AUTO_FIX=false
+            ;;
+        --help|-h)
+            echo "System Security & Optimization Audit Script"
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  -r, --restart-services    Automatically restart systemd services when needed (default: enabled)"
+            echo "  --no-restart-services     Disable automatic service restarts"
+            echo "  -i, --install-packages    Automatically install missing recommended security tools & restart services"
+            echo "  --no-fix                  Disable auto-fix operations"
+            echo "  -h, --help                Show this help message"
+            exit 0
+            ;;
+    esac
+done
+
 # Privilege check: Must be run as root or via sudo
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}Error: This script must be run as a privileged user (root or via sudo).${NC}"
     exit 1
 fi
-
-# Configuration & Execution Modes (Sequential Auto-Audit & Remediation)
-AUTO_FIX=true
-CLEAN_CACHE=true
-GENERATE_REPORT=true
-REPORT_DIR="$HOME/Labolatory/bash/reports"
 
 # Executive Scorecard Counters
 PASSED_COUNT=0
@@ -99,6 +131,63 @@ find_tool() {
     echo "$path"
 }
 
+# Helper function to restart systemd services when needed
+restart_service() {
+    local service="$1"
+    local reason="${2:-auto-remediation}"
+
+    if [[ "$AUTO_RESTART_SERVICES" != true ]]; then
+        echo -e "${YELLOW}[SKIP] Service restart skipped for '${service}' (AUTO_RESTART_SERVICES=false).${NC}"
+        return 0
+    fi
+
+    if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
+        echo -n "Restarting service '${service}' (${reason})... "
+        if run_sudo systemctl restart "$service" 2>/dev/null; then
+            log_pass "Service '${service}' restarted successfully."
+            return 0
+        else
+            log_warn "Failed to restart service '${service}'."
+            return 1
+        fi
+    else
+        echo -e "${YELLOW}systemctl not available; cannot restart service '${service}'.${NC}"
+        return 1
+    fi
+}
+
+# Helper function to install missing package and restart associated service
+install_pkg_and_restart_service() {
+    local pkg="$1"
+    local service="${2:-$1}"
+
+    if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+        echo -e "${YELLOW}Installing package '${pkg}' via APT...${NC}"
+        if run_sudo "${TOOL_BIN['apt-get']}" install -y "$pkg" 2>/dev/null; then
+            log_pass "Package '${pkg}' installed successfully."
+            TOOL_FOUND["$pkg"]=1
+            TOOL_BIN["$pkg"]=$(find_tool "$pkg")
+            if [[ "$AUTO_RESTART_SERVICES" == true && -n "$service" ]]; then
+                restart_service "$service" "after package installation"
+            fi
+        else
+            log_warn "Failed to install package '${pkg}' via APT."
+        fi
+    elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
+        echo -e "${YELLOW}Installing package '${pkg}' via DNF...${NC}"
+        if run_sudo "${TOOL_BIN['dnf']}" install -y "$pkg" 2>/dev/null; then
+            log_pass "Package '${pkg}' installed successfully."
+            TOOL_FOUND["$pkg"]=1
+            TOOL_BIN["$pkg"]=$(find_tool "$pkg")
+            if [[ "$AUTO_RESTART_SERVICES" == true && -n "$service" ]]; then
+                restart_service "$service" "after package installation"
+            fi
+        else
+            log_warn "Failed to install package '${pkg}' via DNF."
+        fi
+    fi
+}
+
 # --- Tool Cache & Pre-Flight Dependency Inspection ---
 declare -A TOOL_BIN
 declare -A TOOL_FOUND
@@ -134,11 +223,35 @@ check_all_dependencies() {
     done
 
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
-        echo -e "\n${YELLOW}Recommended Security Tools Installation Tip:${NC}"
-        if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
-            echo -e "  Debian/Ubuntu: ${CYAN}sudo apt install ${missing_tools[*]}${NC}"
-        elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
-            echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install ${missing_tools[*]}${NC}"
+        if [[ "$INSTALL_MISSING_PKGS" == true ]]; then
+            echo -e "\n${YELLOW}=== Auto-Installing Missing Security Tools & Restarting Services ===${NC}"
+            for m_tool in "${missing_tools[@]}"; do
+                case "$m_tool" in
+                    clamscan|freshclam)
+                        install_pkg_and_restart_service "clamav" "clamav-freshclam"
+                        ;;
+                    needrestart)
+                        install_pkg_and_restart_service "needrestart" ""
+                        ;;
+                    rkhunter)
+                        install_pkg_and_restart_service "rkhunter" ""
+                        ;;
+                    trivy)
+                        install_pkg_and_restart_service "trivy" ""
+                        ;;
+                    *)
+                        install_pkg_and_restart_service "$m_tool" "$m_tool"
+                        ;;
+                esac
+            done
+        else
+            echo -e "\n${YELLOW}Recommended Security Tools Installation Tip:${NC}"
+            if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+                echo -e "  Debian/Ubuntu: ${CYAN}sudo apt install ${missing_tools[*]}${NC}"
+            elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
+                echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install ${missing_tools[*]}${NC}"
+            fi
+            echo -e "  Tip: Run with ${CYAN}--install-packages${NC} or ${CYAN}-i${NC} to auto-install missing tools & start/restart services."
         fi
     fi
     echo ""
@@ -447,6 +560,13 @@ audit_network_security_and_tunnels() {
             log_pass "ufw firewall service is active."
         else
             log_warn "Firewall service (firewalld/ufw) is inactive!"
+            if [[ "$AUTO_RESTART_SERVICES" == true && "$AUTO_FIX" == true ]]; then
+                if systemctl list-unit-files 2>/dev/null | grep -q "^ufw\.service"; then
+                    restart_service "ufw" "activating firewall daemon"
+                elif systemctl list-unit-files 2>/dev/null | grep -q "^firewalld\.service"; then
+                    restart_service "firewalld" "activating firewall daemon"
+                fi
+            fi
         fi
     fi
 
@@ -515,8 +635,15 @@ audit_network_security_and_tunnels
 
 # 6. Antivirus & Rootkit Audit (ClamAV / rkhunter)
 section "6/20" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
-if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]] && systemctl is-active --quiet clamav-freshclam; then
-    log_pass "clamav-freshclam service is active."
+if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
+    if systemctl is-active --quiet clamav-freshclam; then
+        log_pass "clamav-freshclam service is active."
+    elif systemctl list-unit-files 2>/dev/null | grep -q "^clamav-freshclam\.service"; then
+        log_warn "clamav-freshclam service is installed but inactive."
+        if [[ "$AUTO_RESTART_SERVICES" == true && "$AUTO_FIX" == true ]]; then
+            restart_service "clamav-freshclam" "activating antivirus signature update daemon"
+        fi
+    fi
 fi
 
 if [[ "${TOOL_FOUND['clamscan']}" -eq 1 ]]; then
@@ -955,6 +1082,19 @@ if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
     FAILED_SERVICES=$(systemctl --failed --no-legend 2>/dev/null)
     if [[ -n "$FAILED_SERVICES" ]]; then
         log_warn "Found failed systemd services:\n$FAILED_SERVICES"
+        if [[ "$AUTO_RESTART_SERVICES" == true ]]; then
+            echo -e "${YELLOW}Attempting automatic recovery/restart of failed systemd services...${NC}"
+            while read -r svc_line; do
+                [[ -z "$svc_line" ]] && continue
+                local f_svc
+                f_svc=$(echo "$svc_line" | awk '{print $1}')
+                if [[ -n "$f_svc" ]]; then
+                    restart_service "$f_svc" "recovering failed unit"
+                fi
+            done <<< "$FAILED_SERVICES"
+        else
+            echo -e "${YELLOW}Tip: Set AUTO_RESTART_SERVICES=true or run with --restart-services to auto-restart failed units.${NC}"
+        fi
     else
         log_pass "No failed systemd services."
     fi
@@ -1679,8 +1819,23 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     done
 
     if [[ "${TOOL_FOUND['needrestart']}" -eq 1 ]]; then
-        echo -e "\n${CYAN}Needrestart Check (Services needing restart):${NC}"
-        run_sudo "${TOOL_BIN['needrestart']}" -b 2>/dev/null | grep 'NEEDRESTART-SVC' || echo -e "${GREEN}✓ No background services require restart.${NC}"
+        echo -e "\n${CYAN}Needrestart Check (Services needing restart after package updates):${NC}"
+        local svcs_needing_restart
+        svcs_needing_restart=$(run_sudo "${TOOL_BIN['needrestart']}" -b 2>/dev/null | grep 'NEEDRESTART-SVC:' | awk '{print $2}')
+        if [[ -n "$svcs_needing_restart" ]]; then
+            log_warn "Background services require restart due to updated binaries/libraries:\n$svcs_needing_restart"
+            if [[ "$AUTO_RESTART_SERVICES" == true ]]; then
+                echo -e "${YELLOW}Auto-restarting outdated background services...${NC}"
+                while read -r svc; do
+                    [[ -z "$svc" ]] && continue
+                    restart_service "$svc" "outdated binary/library after package update"
+                done <<< "$svcs_needing_restart"
+            else
+                echo -e "${YELLOW}Tip: Set AUTO_RESTART_SERVICES=true or run with --restart-services to auto-restart outdated services.${NC}"
+            fi
+        else
+            echo -e "${GREEN}✓ No background services require restart.${NC}"
+        fi
     fi
 else
     echo -e "${YELLOW}Unsupported package manager. Skipping repository kernel & package audit.${NC}"
