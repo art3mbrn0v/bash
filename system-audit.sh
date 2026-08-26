@@ -23,6 +23,12 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# Privilege check: Must be run as root or via sudo
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}Error: This script must be run as a privileged user (root or via sudo).${NC}"
+    exit 1
+fi
+
 # Configuration & Execution Modes (Sequential Auto-Audit & Remediation)
 AUTO_FIX=true
 CLEAN_CACHE=true
@@ -43,11 +49,6 @@ exec > >(tee >(sed -r 's/\x1B\[[0-9;]*[mK]//g' > "$REPORT_FILE")) 2>&1
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}=== Starting System Security & Optimization Audit ===${NC}"
 echo -e "${CYAN}=====================================================${NC}"
-
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${YELLOW}Note: Running as non-root user. Deep system inspections (system logs, rootkit scans, password hashes) may be limited.${NC}"
-    echo -e "${YELLOW}Tip: For complete audit coverage, run with 'sudo $0'\n${NC}"
-fi
 
 # --- Helper Functions & Tool Resolution ---
 
