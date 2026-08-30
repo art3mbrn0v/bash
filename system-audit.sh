@@ -93,6 +93,10 @@ WARNING_COUNT=0
 CRITICAL_COUNT=0
 TOTAL_CHECKS=0
 
+# Audit Timestamp & Execution Time Tracking
+AUDIT_START_TIME_SEC=$(date +%s)
+AUDIT_START_TIME_STR=$(date "+%Y-%m-%d %H:%M:%S %Z")
+
 # Automatic Report Teeing (Markdown Log Generation)
 mkdir -p "$REPORT_DIR" 2>/dev/null || true
 REPORT_FILE="$REPORT_DIR/audit-report-$(date +%Y-%m-%d_%H-%M-%S).md"
@@ -101,6 +105,7 @@ exec > >(tee >(sed -r 's/\x1B\[[0-9;]*[mK]//g' > "$REPORT_FILE")) 2>&1
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}=== Starting System Security & Optimization Audit ===${NC}"
 echo -e "${CYAN}=====================================================${NC}"
+echo -e "Audit Started At : ${CYAN}${AUDIT_START_TIME_STR}${NC}"
 
 # --- Helper Functions & Tool Resolution ---
 
@@ -218,7 +223,7 @@ TOOLS_TO_CHECK=(
     "freshclam" "rkhunter" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
     "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
-    "curl" "wget" "cryptsetup"
+    "curl" "wget" "cryptsetup" "unhide"
 )
 
 check_all_dependencies() {
@@ -916,10 +921,6 @@ audit_directory_permissions() {
     fi
 
     # 7. LUKS Cryptographic Keyfiles Audit in Temporary Directories (/tmp, /var/tmp, /dev/shm)
-    audit_luks_keys_in_temp
-}
-
-audit_luks_keys_in_temp() {
     echo -e "\n${CYAN}7. Auditing LUKS Cryptographic Keyfiles in Temporary Directories (/tmp, /var/tmp, /dev/shm):${NC}"
     local temp_paths=("/tmp" "/var/tmp" "/dev/shm")
     local luks_keys_found=0
@@ -964,7 +965,7 @@ audit_luks_keys_in_temp() {
         done
     done
 
-    # 3. Check for binary LUKS header/key files in temporary directories using cryptsetup or file header magic
+    # 3. Check for binary LUKS header/key files in temporary directories using cryptsetup
     local cs_cmd="${TOOL_BIN['cryptsetup']}"
     [[ -z "$cs_cmd" ]] && cs_cmd=$(find_tool "cryptsetup")
 
@@ -1141,8 +1142,49 @@ parse_security_logs() {
 
 parse_security_logs
 
+audit_timezone_and_time_sync() {
+    echo -e "${YELLOW}--- System Timezone & Time Synchronization Audit ---${NC}"
+    local tz_abbr tz_offset tz_target ntp_sync ntp_service
+
+    tz_abbr=$(date "+%Z")
+    tz_offset=$(date "+%z")
+
+    if [[ -L "/etc/localtime" ]]; then
+        tz_target=$(readlink -f /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+    elif [[ -f "/etc/timezone" ]]; then
+        tz_target=$(cat /etc/timezone 2>/dev/null)
+    else
+        tz_target="$tz_abbr"
+    fi
+
+    echo -e "  Configured Timezone        : ${CYAN}${tz_target:-$tz_abbr}${NC} (${tz_abbr}, UTC${tz_offset})"
+
+    local is_synced=false
+    if command -v timedatectl &>/dev/null; then
+        ntp_sync=$(timedatectl status 2>/dev/null | grep -i "System clock synchronized:" | awk '{print $4}')
+        ntp_service=$(timedatectl status 2>/dev/null | grep -i "NTP service:" | awk '{print $3}')
+
+        [[ "$ntp_sync" == "yes" ]] && is_synced=true
+        echo -e "  NTP Time Sync Service      : ${CYAN}${ntp_service:-unknown}${NC}"
+        echo -e "  System Clock Synchronized  : ${CYAN}${ntp_sync:-unknown}${NC}"
+    else
+        if systemctl is-active --quiet systemd-timesyncd || systemctl is-active --quiet chronyd || systemctl is-active --quiet ntp; then
+            is_synced=true
+        fi
+    fi
+
+    if [[ "$is_synced" == true ]]; then
+        log_pass "Timezone configuration ('${tz_target:-$tz_abbr}') verified & system clock is synchronized via NTP."
+    else
+        log_warn "Timezone is configured ('${tz_target:-$tz_abbr}'), but system clock is NOT synchronized with NTP servers!"
+    fi
+    echo ""
+}
+
 # 9. System Optimization & Resource Audit
 section "9/20" "Checking System Resources & Optimization Opportunities..."
+audit_timezone_and_time_sync
+
 echo -e "${YELLOW}--- Disk Space Usage & Free Space Check ---${NC}"
 df -h -x tmpfs -x devtmpfs -x squashfs
 
@@ -2133,7 +2175,134 @@ audit_suspicious_processes() {
         log_pass "No reverse shell command patterns detected."
     fi
 
-    echo -e "\n${YELLOW}--- 5. Top CPU & RAM Consuming Processes ---${NC}"
+    echo -e "\n${YELLOW}--- 5. Checking for Hidden Processes & Rootkit Stealth Techniques ---${NC}"
+    local hidden_found=0
+    local hidden_procs_list=""
+
+    # 1. LD_PRELOAD Userland Rootkit Inspection (/etc/ld.so.preload)
+    if [[ -f "/etc/ld.so.preload" ]]; then
+        local preload_content
+        preload_content=$(run_sudo cat /etc/ld.so.preload 2>/dev/null | grep -v '^\s*#')
+        if [[ -n "$preload_content" ]]; then
+            log_crit "POTENTIAL USERLAND ROOTKIT: /etc/ld.so.preload exists and contains preloaded libraries:\n$preload_content"
+            ((hidden_found++))
+            ((threats_found++))
+        fi
+    fi
+
+    # 2. /proc PID directory vs 'ps' process table comparison
+    local proc_pids ps_pids
+    proc_pids=$(find /proc -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | awk -F/ '{print $2}' | sort -n)
+    ps_pids=$(ps -eo pid= 2>/dev/null | tr -d ' ' | sort -n)
+
+    if [[ -n "$proc_pids" && -n "$ps_pids" ]]; then
+        local hidden_pids
+        hidden_pids=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids"))
+
+        if [[ -n "$hidden_pids" ]]; then
+            while read -r hpid; do
+                [[ -z "$hpid" ]] && continue
+                # Verify PID is still active in /proc to filter transient processes
+                if [[ -d "/proc/$hpid" ]]; then
+                    local hname huser hcmd
+                    hname=$(run_sudo cat "/proc/$hpid/comm" 2>/dev/null || echo "Unknown")
+                    hcmd=$(run_sudo cat "/proc/$hpid/cmdline" 2>/dev/null | tr '\0' ' ' || echo "N/A")
+                    huser=$(run_sudo stat -c "%U" "/proc/$hpid" 2>/dev/null || echo "Unknown")
+                    hidden_procs_list+="PID ${hpid} (User: ${huser}, Name: ${hname}) [Cmd: ${hcmd}]\n"
+                    ((hidden_found++))
+                    ((threats_found++))
+                fi
+            done <<< "$hidden_pids"
+        fi
+    fi
+
+    if [[ -n "$hidden_procs_list" ]]; then
+        log_crit "HIDDEN PROCESSES DETECTED (Present in /proc but hidden from 'ps'):\n$hidden_procs_list"
+    fi
+
+    # 3. Deep Hidden Process Scan using 'unhide' tool if installed
+    local unhide_cmd="${TOOL_BIN['unhide']}"
+    [[ -z "$unhide_cmd" ]] && unhide_cmd=$(find_tool "unhide")
+
+    if [[ -n "$unhide_cmd" ]]; then
+        echo -e "${CYAN}Running deep hidden process detection using 'unhide'...${NC}"
+        local unhide_out
+        unhide_out=$(run_sudo "$unhide_cmd" -m proc sys 2>/dev/null | grep -i "Found HIDDEN")
+        if [[ -n "$unhide_out" ]]; then
+            log_crit "Unhide tool detected hidden processes:\n$unhide_out"
+            ((hidden_found++))
+            ((threats_found++))
+        fi
+    fi
+
+    if [[ "$hidden_found" -eq 0 ]]; then
+        log_pass "Hidden process audit completed: No hidden processes or /etc/ld.so.preload rootkit indicators found."
+    fi
+
+    echo -e "\n${YELLOW}--- 6. Auditing Zombie & Orphan Processes ---${NC}"
+    local zombie_count=0
+    local orphan_count=0
+
+    # 1. Zombie Processes Check & Remediation
+    local zombie_procs
+    zombie_procs=$(ps -eo pid,ppid,user,stat,comm 2>/dev/null | awk '$4 ~ /^Z/ {print $1":"$2":"$3":"$5}')
+
+    if [[ -n "$zombie_procs" ]]; then
+        echo -e "${CYAN}Discovered Zombie (Defunct) Processes:${NC}"
+        while IFS=: read -r zpid zppid zuser zcomm; do
+            [[ -z "$zpid" ]] && continue
+            ((zombie_count++))
+            ((threats_found++))
+            local pcomm
+            pcomm=$(ps -p "$zppid" -o comm= 2>/dev/null || echo "Unknown")
+            log_warn "ZOMBIE PROCESS: PID ${zpid} (Name: '${zcomm}', User: ${zuser}) | Parent PPID ${zppid} (Name: '${pcomm}')"
+
+            if [[ "$AUTO_FIX" == true ]]; then
+                echo -n "  Attempting cleanup of Zombie PID ${zpid} (Notifying Parent PPID ${zppid})... "
+                # Step A: Send SIGCHLD to parent process to harvest zombie
+                run_sudo kill -SIGCHLD "$zppid" 2>/dev/null
+                sleep 0.2
+                if ! ps -p "$zpid" &>/dev/null; then
+                    log_pass "Zombie PID ${zpid} successfully harvested by parent process."
+                else
+                    # Step B: If parent is not init/systemd, terminate parent process so PID 1 inherits and reaps the zombie
+                    if [[ "$zppid" -gt 1 && "$pcomm" != "systemd" && "$pcomm" != "init" ]]; then
+                        echo -n "  Parent did not harvest. Terminating parent process PPID ${zppid} (${pcomm})... "
+                        run_sudo kill -15 "$zppid" 2>/dev/null || run_sudo kill -9 "$zppid" 2>/dev/null
+                        sleep 0.2
+                        if ! ps -p "$zpid" &>/dev/null; then
+                            log_pass "Zombie PID ${zpid} reaped after parent process termination."
+                        else
+                            log_warn "Could not clean Zombie PID ${zpid} (Parent PPID ${zppid} active)."
+                        fi
+                    else
+                        log_warn "Cannot kill Parent PPID ${zppid} (System daemon/Init)."
+                    fi
+                fi
+            fi
+        done <<< "$zombie_procs"
+    else
+        log_pass "No Zombie (defunct) processes detected."
+    fi
+
+    # 2. Orphan Processes Check
+    echo -e "\n${CYAN}Auditing Active Orphan Processes (Re-parented to PID 1):${NC}"
+    local orphan_procs=""
+    while read -r opid ouser ostat oargs; do
+        [[ -z "$opid" ]] && continue
+        if [[ "$oargs" != *systemd* && "$oargs" != *dbus* && "$oargs" != *sshd* && "$oargs" != *NetworkManager* && "$oargs" != *journald* ]]; then
+            orphan_procs+="PID ${opid} (User: ${ouser}, Stat: ${ostat}) [Cmd: ${oargs}]\n"
+            ((orphan_count++))
+        fi
+    done < <(ps -eo pid,user,stat,args 2>/dev/null | awk '$1 != 1 && $2 != "root" && $3 !~ /^Z/ {print $1, $2, $3, $4}')
+
+    if [[ -n "$orphan_procs" ]]; then
+        log_warn "Discovered non-system Orphan processes (PPID=1):\n$orphan_procs"
+    else
+        log_pass "No non-system orphan processes detected."
+    fi
+
+    echo -e "\n${YELLOW}--- 7. Top CPU & RAM Consuming Processes ---${NC}"
     echo -e "${CYAN}Highest CPU Processes (>70% CPU):${NC}"
     local high_cpu
     high_cpu=$(ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | awk 'NR>1 && $3 > 70.0 {print $0}')
@@ -2484,17 +2653,28 @@ audit_wifi_and_network_hosts() {
 }
 audit_wifi_and_network_hosts
 
-# --- Executive Audit Summary Scorecard ---
 print_scorecard() {
-    echo -e "\n${CYAN}=====================================================${NC}"
-    echo -e "${CYAN}===           AUDIT EXECUTIVE SCORECARD           ===${NC}"
-    echo -e "${CYAN}=====================================================${NC}"
+    AUDIT_END_TIME_SEC=$(date +%s)
+    AUDIT_END_TIME_STR=$(date "+%Y-%m-%d %H:%M:%S %Z")
+    local duration_sec=$(( AUDIT_END_TIME_SEC - AUDIT_START_TIME_SEC ))
+    local mins=$(( duration_sec / 60 ))
+    local secs=$(( duration_sec % 60 ))
+    local duration_fmt=""
+    if [[ $mins -gt 0 ]]; then
+        duration_fmt="${mins}m ${secs}s"
+    else
+        duration_fmt="${secs}s"
+    fi
 
     local score=100
     if [[ $TOTAL_CHECKS -gt 0 ]]; then
         score=$(( (PASSED_COUNT * 100) / TOTAL_CHECKS ))
     fi
 
+    printf "  %-30s : %s\n" "Audit Started At" "$AUDIT_START_TIME_STR"
+    printf "  %-30s : %s\n" "Audit Completed At" "$AUDIT_END_TIME_STR"
+    printf "  %-30s : %s\n" "Total Execution Duration" "$duration_fmt"
+    echo -e "-----------------------------------------------------"
     printf "  %-30s : %d\n" "Total Security Checks" "$TOTAL_CHECKS"
     printf "  %-30s : ${GREEN}%d${NC}\n" "Checks Passed" "$PASSED_COUNT"
     printf "  %-30s : ${YELLOW}%d${NC}\n" "Warnings / Suggestions" "$WARNING_COUNT"
