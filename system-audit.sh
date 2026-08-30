@@ -31,6 +31,14 @@ AUTO_RESTART_SERVICES=true
 INSTALL_MISSING_PKGS=false
 REPORT_DIR="$HOME/Labolatory/bash/reports"
 
+# External public GitHub password databases for weak password dictionary checks
+EXTERNAL_PASSWORD_LIST_URLS=(
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt"
+    "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/500-worst-passwords.txt"
+    "https://raw.githubusercontent.com/berzerk0/Probable-Wordlists/master/Real-Passwords/Top12Thousand-probable-v2.txt"
+)
+FETCH_EXTERNAL_PASSWORDS=true
+
 # CLI Arguments Parser
 for arg in "$@"; do
     case "$arg" in
@@ -43,6 +51,15 @@ for arg in "$@"; do
         --install-packages|-i)
             INSTALL_MISSING_PKGS=true
             ;;
+        --fetch-passwords)
+            FETCH_EXTERNAL_PASSWORDS=true
+            ;;
+        --no-fetch-passwords)
+            FETCH_EXTERNAL_PASSWORDS=false
+            ;;
+        --password-url=*)
+            EXTERNAL_PASSWORD_LIST_URLS+=("${arg#*=}")
+            ;;
         --no-fix)
             AUTO_FIX=false
             ;;
@@ -54,6 +71,9 @@ for arg in "$@"; do
             echo "  -r, --restart-services    Automatically restart systemd services when needed (default: enabled)"
             echo "  --no-restart-services     Disable automatic service restarts"
             echo "  -i, --install-packages    Automatically install missing recommended security tools & restart services"
+            echo "  --fetch-passwords         Fetch external weak password databases from GitHub (default: enabled)"
+            echo "  --no-fetch-passwords      Disable fetching external password databases from GitHub"
+            echo "  --password-url=<url>      Add custom public password list URL for dictionary checks"
             echo "  --no-fix                  Disable auto-fix operations"
             echo "  -h, --help                Show this help message"
             exit 0
@@ -198,6 +218,7 @@ TOOLS_TO_CHECK=(
     "freshclam" "rkhunter" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
     "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
+    "curl" "wget" "cryptsetup"
 )
 
 check_all_dependencies() {
@@ -893,6 +914,76 @@ audit_directory_permissions() {
     else
         log_pass "No accumulated rotated log archives in /var/log."
     fi
+
+    # 7. LUKS Cryptographic Keyfiles Audit in Temporary Directories (/tmp, /var/tmp, /dev/shm)
+    audit_luks_keys_in_temp
+}
+
+audit_luks_keys_in_temp() {
+    echo -e "\n${CYAN}7. Auditing LUKS Cryptographic Keyfiles in Temporary Directories (/tmp, /var/tmp, /dev/shm):${NC}"
+    local temp_paths=("/tmp" "/var/tmp" "/dev/shm")
+    local luks_keys_found=0
+
+    # 1. Inspect /etc/crypttab for references to keyfiles residing in temporary directories
+    if [[ -f "/etc/crypttab" ]]; then
+        while read -r line; do
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            local target_name dev_path key_path
+            target_name=$(echo "$line" | awk '{print $1}')
+            dev_path=$(echo "$line" | awk '{print $2}')
+            key_path=$(echo "$line" | awk '{print $3}')
+
+            if [[ "$key_path" =~ ^/tmp/|^/var/tmp/|^/dev/shm/ ]]; then
+                ((luks_keys_found++))
+                log_crit "INSECURE CRYPTTAB KEYFILE: Target '${target_name}' in /etc/crypttab uses keyfile in temp directory: ${key_path}!"
+            fi
+        done < /etc/crypttab
+    fi
+
+    # 2. Search /tmp, /var/tmp, /dev/shm for files matching LUKS / encryption key file patterns
+    local key_patterns=("*luks*" "*keyfile*" "*.keyfile" "*crypt*key*" "*luks*.key" "*luks*.bin" "*volume.key")
+    for tpath in "${temp_paths[@]}"; do
+        [[ -d "$tpath" ]] || continue
+        for pat in "${key_patterns[@]}"; do
+            while read -r kfile; do
+                [[ -f "$kfile" ]] || continue
+                ((luks_keys_found++))
+                local k_perm k_owner
+                k_perm=$(stat -c "%a" "$kfile" 2>/dev/null)
+                k_owner=$(stat -c "%U:%G" "$kfile" 2>/dev/null)
+
+                log_crit "LUKS / Encryption Keyfile detected in temporary directory: '${kfile}' (Permissions: ${k_perm}, Owner: ${k_owner})!"
+
+                if [[ "$AUTO_FIX" == true ]]; then
+                    if [[ "$k_perm" =~ [1-7][1-7]$ ]]; then
+                        run_sudo chmod 600 "$kfile" 2>/dev/null
+                        echo -e "  - ${GREEN}✓ Auto-fix applied:${NC} Secured permissions of '${kfile}' to 600."
+                    fi
+                fi
+            done < <(find "$tpath" -maxdepth 3 -type f -name "$pat" 2>/dev/null)
+        done
+    done
+
+    # 3. Check for binary LUKS header/key files in temporary directories using cryptsetup or file header magic
+    local cs_cmd="${TOOL_BIN['cryptsetup']}"
+    [[ -z "$cs_cmd" ]] && cs_cmd=$(find_tool "cryptsetup")
+
+    if [[ -n "$cs_cmd" ]]; then
+        for tpath in "${temp_paths[@]}"; do
+            [[ -d "$tpath" ]] || continue
+            while read -r cand_file; do
+                [[ -f "$cand_file" ]] || continue
+                if run_sudo "$cs_cmd" isLuks "$cand_file" 2>/dev/null; then
+                    ((luks_keys_found++))
+                    log_crit "LUKS Encrypted Volume Header / Container image found in temporary directory: '${cand_file}'!"
+                fi
+            done < <(find "$tpath" -maxdepth 2 -type f \( -name "*.img" -o -name "*.raw" -o -name "*.luks" -o -name "*.key" \) 2>/dev/null)
+        done
+    fi
+
+    if [[ "$luks_keys_found" -eq 0 ]]; then
+        log_pass "No LUKS keyfiles or crypttab key references found in temporary directories (/tmp, /var/tmp, /dev/shm)."
+    fi
 }
 
 audit_directory_permissions
@@ -1449,11 +1540,22 @@ audit_passwd_group_shadow() {
             local sys_hostname
             sys_hostname=$(hostname 2>/dev/null)
 
+            local ext_urls=""
+            if [[ "$FETCH_EXTERNAL_PASSWORDS" == true && ${#EXTERNAL_PASSWORD_LIST_URLS[@]} -gt 0 ]]; then
+                ext_urls=$(IFS=","; echo "${EXTERNAL_PASSWORD_LIST_URLS[*]}")
+                echo -e "  Fetching external password databases from GitHub repositories..."
+            fi
+
             local py_result
-            py_result=$(run_sudo "$py_cmd" - "$sys_hostname" << 'PYEOF' 2>/dev/null
+            py_result=$(run_sudo "$py_cmd" - "$sys_hostname" "$ext_urls" << 'PYEOF' 2>/dev/null
 import sys, ctypes, ctypes.util, os
+try:
+    import urllib.request
+except ImportError:
+    urllib = None
 
 hostname = sys.argv[1] if len(sys.argv) > 1 else ""
+ext_urls_str = sys.argv[2] if len(sys.argv) > 2 else ""
 
 libname = ctypes.util.find_library('crypt')
 lib = None
@@ -1474,6 +1576,25 @@ common_passwords = [
 ]
 if hostname:
     common_passwords.append(hostname.lower())
+
+if ext_urls_str and urllib:
+    urls = [u.strip() for u in ext_urls_str.split(',') if u.strip()]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                lines = resp.read().decode('utf-8', errors='ignore').splitlines()
+                added = 0
+                for line in lines:
+                    p = line.strip()
+                    if p and not p.startswith('#'):
+                        common_passwords.append(p)
+                        added += 1
+                fname = url.split('/')[-1]
+                print(f"FETCHED:{fname}:{added}")
+        except Exception as err:
+            fname = url.split('/')[-1]
+            print(f"FETCH_ERR:{fname}:{err}")
 
 weak_found = []
 algo_counts = {}
@@ -1506,6 +1627,7 @@ if os.path.exists('/etc/shadow'):
                                 weak_found.append((user, p))
                                 break
 
+print("TOTAL_PASSWORDS:" + str(len(set(common_passwords))))
 print("ALGOS:" + ",".join([f"{k}:{v}" for k,v in algo_counts.items()]))
 for u, p in weak_found:
     print(f"WEAK:{u}:{p}")
@@ -1513,6 +1635,24 @@ PYEOF
             )
 
             if [[ -n "$py_result" ]]; then
+                while read -r line; do
+                    if [[ "$line" =~ ^FETCHED: ]]; then
+                        local fname count
+                        fname=$(echo "$line" | cut -d: -f2)
+                        count=$(echo "$line" | cut -d: -f3)
+                        echo -e "  - ${GREEN}✓${NC} Loaded ${CYAN}${count}${NC} passwords from GitHub (${fname})"
+                    elif [[ "$line" =~ ^FETCH_ERR: ]]; then
+                        local fname err
+                        fname=$(echo "$line" | cut -d: -f2)
+                        err=$(echo "$line" | cut -d: -f3)
+                        echo -e "  - ${YELLOW}!${NC} Failed to fetch GitHub password list (${fname}): ${err}"
+                    elif [[ "$line" =~ ^TOTAL_PASSWORDS: ]]; then
+                        local total_pass
+                        total_pass=$(echo "$line" | cut -d: -f2)
+                        echo -e "  Total unique dictionary passwords evaluated: ${CYAN}${total_pass}${NC}"
+                    fi
+                done <<< "$py_result"
+
                 local algos
                 algos=$(echo "$py_result" | grep '^ALGOS:' | cut -d: -f2)
                 if [[ -n "$algos" ]]; then
