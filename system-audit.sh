@@ -1806,12 +1806,24 @@ PYEOF
     # --- 10.7 PAM Authentication Stack Audit ---
     echo -e "\n${YELLOW}--- 10.7 PAM Authentication Stack Audit (/etc/pam.d/*) ---${NC}"
     if [[ -d "/etc/pam.d" ]]; then
-        local pam_permit
+        local pam_permit pam_exec pam_nonstandard
         pam_permit=$(grep -Ei "^\s*auth\s+sufficient\s+pam_permit\.so" /etc/pam.d/* 2>/dev/null)
         if [[ -n "$pam_permit" ]]; then
             log_crit "Bypassed authentication found in PAM stack (pam_permit.so sufficient):\n$pam_permit"
         else
             log_pass "PAM authentication stack verified (No unconditional pam_permit bypasses)."
+        fi
+
+        pam_exec=$(grep -Ei "pam_exec\.so" /etc/pam.d/* 2>/dev/null | grep -v '^\s*#')
+        if [[ -n "$pam_exec" ]]; then
+            log_warn "PAM exec module (pam_exec.so) detected in auth stack (Potential keylogging/hook):\n$pam_exec"
+        else
+            log_pass "No pam_exec.so hooks detected in PAM configuration."
+        fi
+
+        pam_nonstandard=$(grep -Ei "\.so" /etc/pam.d/* 2>/dev/null | grep -E "/tmp/|/var/tmp/|/dev/shm/|/home/")
+        if [[ -n "$pam_nonstandard" ]]; then
+            log_crit "UNAUTHORIZED PAM MODULE: PAM configuration loads module from temporary/user directory:\n$pam_nonstandard"
         fi
     fi
     # --- 10.8 Database Unauthenticated & Passwordless Access Audit ---
@@ -2393,6 +2405,39 @@ audit_shell_configs_and_aliases() {
         fi
 
     done < /etc/passwd
+
+    echo -e "\n${YELLOW}--- Auditing System \$PATH Environment Directories for Binary Hijacking Risk ---${NC}"
+    local path_dirs=()
+    IFS=':' read -ra path_dirs <<< "$PATH"
+
+    local path_issues=0
+    for pdir in "${path_dirs[@]}"; do
+        if [[ -z "$pdir" || "$pdir" == "." ]]; then
+            log_crit "DANGEROUS \$PATH ENTRY: Current directory '.' or empty entry found in \$PATH! Vulnerable to local binary hijacking."
+            ((path_issues++))
+            continue
+        fi
+
+        if [[ ! -d "$pdir" ]]; then
+            log_warn "\$PATH directory '${pdir}' does not exist."
+            continue
+        fi
+
+        local p_perm p_owner
+        p_perm=$(stat -c "%a" "$pdir" 2>/dev/null)
+        p_owner=$(stat -c "%U" "$pdir" 2>/dev/null)
+
+        if [[ "$p_perm" =~ [1-7][1-7]$ ]]; then
+            log_crit "WORLD-WRITABLE \$PATH DIRECTORY: '${pdir}' (Mode: ${p_perm}, Owner: ${p_owner})! Local users can drop malicious binaries to hijack root/user commands."
+            ((path_issues++))
+        elif [[ "$p_owner" != "root" ]]; then
+            log_warn "\$PATH directory '${pdir}' is owned by non-root user '${p_owner}' (Mode: ${p_perm})."
+        fi
+    done
+
+    if [[ "$path_issues" -eq 0 ]]; then
+        log_pass "All directories in system \$PATH are secure and owned by root."
+    fi
 }
 
 audit_shell_configs_and_aliases
@@ -2542,6 +2587,17 @@ audit_kernel_hardening() {
     check_sysctl "kernel.dmesg_restrict" "1"
     check_sysctl "fs.protected_symlinks" "1"
     check_sysctl "fs.protected_hardlinks" "1"
+    check_sysctl "fs.suid_dumpable" "0"
+
+    echo -e "\n${YELLOW}--- Core Dumps & Memory Leakage Hardening ---${NC}"
+    local core_pattern
+    core_pattern=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)
+    echo -e "  System Core Pattern        : ${CYAN}${core_pattern:-default}${NC}"
+    if [[ "$core_pattern" =~ ^/tmp/|^/var/tmp/|^/dev/shm/ ]]; then
+        log_crit "INSECURE CORE PATTERN: Core dumps write process memory to world-writable directory: ${core_pattern}!"
+    else
+        log_pass "Core dump pattern configuration verified."
+    fi
 }
 audit_kernel_hardening
 
