@@ -4,16 +4,8 @@
 # Comprehensive System Security & Optimization Audit Script
 # ==============================================================================
 
-# --- Configuration ---
-SENSITIVE_PATTERNS=(
-    "password" "secret" "token" "passwd" "auth.db" "rbcpass"
-    "SA\$YXy" "info.txt" "account-info" "pass_keys" "access-keys"
-    "credentials" "api_key" "PB24" "githubinfo" "udemycom-info"
-    "reddit-info" "soundcloudinfo" "cyberghostvpn-info"
-    "digitalocean-info" "chatgpt-info" "bluesky-info" "hetzner.com"
-    "proton-info" "edenred-info" "postat-info" "booking-info"
-    "access-keys.txt" "argocd-initial-admin-secret"
-)
+# Script directory resolution
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Output colors
 RED='\033[0;31m'
@@ -23,63 +15,28 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Configuration & Execution Modes (Sequential Auto-Audit & Remediation)
+# Configuration & Execution Modes (Fully Automated Execution by Default)
 AUTO_FIX=true
 CLEAN_CACHE=true
 GENERATE_REPORT=true
 AUTO_RESTART_SERVICES=true
-INSTALL_MISSING_PKGS=false
-REPORT_DIR="$HOME/Labolatory/bash/reports"
+INSTALL_MISSING_PKGS=true
+FETCH_EXTERNAL_PASSWORDS=true
+REPORT_DIR="${SCRIPT_DIR}/reports"
 
-# External public GitHub password databases for weak password dictionary checks
+# Sensitive file and credential pattern definitions for security auditing
+SENSITIVE_PATTERNS=(
+    "password" "secret" "token" "passwd" "auth.db"
+    "credentials" "api_key" "access_key" "private_key" "id_rsa"
+    "account_info" "pass_keys" "access_keys"
+)
+
+# External public password databases for weak password dictionary checks
 EXTERNAL_PASSWORD_LIST_URLS=(
     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10k-most-common.txt"
     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/500-worst-passwords.txt"
     "https://raw.githubusercontent.com/berzerk0/Probable-Wordlists/master/Real-Passwords/Top12Thousand-probable-v2.txt"
 )
-FETCH_EXTERNAL_PASSWORDS=true
-
-# CLI Arguments Parser
-for arg in "$@"; do
-    case "$arg" in
-        --restart-services|-r)
-            AUTO_RESTART_SERVICES=true
-            ;;
-        --no-restart-services)
-            AUTO_RESTART_SERVICES=false
-            ;;
-        --install-packages|-i)
-            INSTALL_MISSING_PKGS=true
-            ;;
-        --fetch-passwords)
-            FETCH_EXTERNAL_PASSWORDS=true
-            ;;
-        --no-fetch-passwords)
-            FETCH_EXTERNAL_PASSWORDS=false
-            ;;
-        --password-url=*)
-            EXTERNAL_PASSWORD_LIST_URLS+=("${arg#*=}")
-            ;;
-        --no-fix)
-            AUTO_FIX=false
-            ;;
-        --help|-h)
-            echo "System Security & Optimization Audit Script"
-            echo "Usage: $0 [options]"
-            echo ""
-            echo "Options:"
-            echo "  -r, --restart-services    Automatically restart systemd services when needed (default: enabled)"
-            echo "  --no-restart-services     Disable automatic service restarts"
-            echo "  -i, --install-packages    Automatically install missing recommended security tools & restart services"
-            echo "  --fetch-passwords         Fetch external weak password databases from GitHub (default: enabled)"
-            echo "  --no-fetch-passwords      Disable fetching external password databases from GitHub"
-            echo "  --password-url=<url>      Add custom public password list URL for dictionary checks"
-            echo "  --no-fix                  Disable auto-fix operations"
-            echo "  -h, --help                Show this help message"
-            exit 0
-            ;;
-    esac
-done
 
 # Privilege check: Must be run as root or via sudo
 if [[ $EUID -ne 0 ]]; then
@@ -213,6 +170,62 @@ install_pkg_and_restart_service() {
     fi
 }
 
+# Helper function to apply runbook-based automatic permission & system remediations
+apply_runbook_permission_remediations() {
+    echo -e "${YELLOW}--- Applying System Runbook Automatic Permission & System Fixes ---${NC}"
+    local runbook_count=0
+
+    # 1. Fix PAM wtmpdb SQLite Database Permissions (/var/log/wtmp.db -> root:utmp 664)
+    if [[ -f "/var/log/wtmp.db" ]]; then
+        local w_perm w_owner
+        w_perm=$(stat -c "%a" /var/log/wtmp.db 2>/dev/null)
+        w_owner=$(stat -c "%U:%G" /var/log/wtmp.db 2>/dev/null)
+
+        if [[ "$w_owner" != "root:utmp" || "$w_perm" != "664" ]]; then
+            echo -e "  - ${YELLOW}System Runbook §2.3:${NC} Fixing /var/log/wtmp.db permissions (${w_owner} ${w_perm} -> root:utmp 664)..."
+            if run_sudo chown root:utmp /var/log/wtmp.db 2>/dev/null && run_sudo chmod 664 /var/log/wtmp.db 2>/dev/null; then
+                log_pass "Fixed /var/log/wtmp.db permissions to root:utmp 664 (Resolved PAM wtmpdb SQLITE_READONLY error 8)."
+                ((runbook_count++))
+            else
+                log_warn "Failed to set /var/log/wtmp.db permissions to root:utmp 664."
+            fi
+        else
+            log_pass "/var/log/wtmp.db permissions verified (root:utmp 664)."
+        fi
+    fi
+
+    # 2. Fix GTK 3 Theme Parsing Syntax Error (!important in ~/.config/gtk-3.0/gtk.css)
+    while IFS=: read -r username password uid gid gecos home shell; do
+        [[ -d "$home" ]] || continue
+        local gtk_css="$home/.config/gtk-3.0/gtk.css"
+        if [[ -f "$gtk_css" ]] && grep -q "!important" "$gtk_css" 2>/dev/null; then
+            echo -e "  - ${YELLOW}System Runbook §2.1:${NC} Removing '!important' from ${gtk_css} for user ${username}..."
+            sed -i 's/\s*!important//g' "$gtk_css" 2>/dev/null
+            log_pass "Removed '!important' from ${gtk_css} (Resolved GTK 3 CSS theme parsing errors)."
+            ((runbook_count++))
+        fi
+    done < /etc/passwd
+
+    # 3. Fix ALSA Restore Udev Rule GOTO Label Mismatch
+    if [[ -f "/usr/lib/udev/rules.d/90-alsa-restore.rules" ]] && grep -q 'LABEL="alsa_restore_go"' /usr/lib/udev/rules.d/90-alsa-restore.rules 2>/dev/null; then
+        if [[ ! -f "/etc/udev/rules.d/90-alsa-restore.rules" ]] || grep -q 'LABEL="alsa_restore_go"' /etc/udev/rules.d/90-alsa-restore.rules 2>/dev/null; then
+            echo -e "  - ${YELLOW}System Runbook §2.2:${NC} Creating override /etc/udev/rules.d/90-alsa-restore.rules to fix GOTO label mismatch..."
+            run_sudo mkdir -p /etc/udev/rules.d 2>/dev/null
+            run_sudo cp /usr/lib/udev/rules.d/90-alsa-restore.rules /etc/udev/rules.d/ 2>/dev/null
+            run_sudo sed -i 's/LABEL="alsa_restore_go"/LABEL="alsa_restore_std"/2' /etc/udev/rules.d/90-alsa-restore.rules 2>/dev/null
+            if command -v udevadm &>/dev/null; then
+                run_sudo udevadm control --reload-rules 2>/dev/null || true
+            fi
+            log_pass "Created fixed udev rule /etc/udev/rules.d/90-alsa-restore.rules (LABEL=alsa_restore_std)."
+            ((runbook_count++))
+        fi
+    fi
+
+    if [[ "$runbook_count" -gt 0 ]]; then
+        echo -e "  ${GREEN}✓ Applied ${runbook_count} runbook-based automatic permission/system fix(es).${NC}\n"
+    fi
+}
+
 # --- Tool Cache & Pre-Flight Dependency Inspection ---
 declare -A TOOL_BIN
 declare -A TOOL_FOUND
@@ -299,7 +312,11 @@ if [[ "$AUTO_FIX" == true ]]; then
             grep -q "alias mv=" "$rc_file" 2>/dev/null || echo "alias mv='mv -i'" >> "$rc_file"
         fi
     done
-    echo -e "${GREEN}✓ Auto-fix completed: Permissions & safety aliases applied.${NC}\n"
+
+    # Runbook-Based Automatic Permission & System Remediations (~/Labolatory/runbooks/*.md)
+    apply_runbook_permission_remediations
+
+    echo -e "${GREEN}✓ Auto-fix completed: Permissions, safety aliases & runbook fixes applied.${NC}\n"
 fi
 
 # Helper function to update security databases before audit
@@ -991,7 +1008,7 @@ audit_directory_permissions
 
 if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
     echo -e "\n${CYAN}Running Trivy Container/Filesystem Audit...${NC}"
-    "${TOOL_BIN['trivy']}" fs --severity HIGH,CRITICAL --format table "$HOME/Labolatory" 2>/dev/null
+    "${TOOL_BIN['trivy']}" fs --severity HIGH,CRITICAL --format table "${SCRIPT_DIR}" 2>/dev/null
 else
     echo -e "${YELLOW}Trivy not installed. (Install trivy for vulnerability scanning of code/containers).${NC}"
 fi
