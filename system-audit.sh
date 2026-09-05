@@ -1957,7 +1957,90 @@ PYEOF
 audit_passwd_group_shadow
 
 # 11. Repository Kernel & Security Package Updates Audit
-section "11/20" "Auditing Repository Kernel Updates & Recommended Security Packages..."
+# 11. Package Manager & Repository Audit
+section "11/20" "Auditing Package Repositories, Kernel Updates & Recommended Packages..."
+
+audit_package_repositories() {
+    echo -e "${YELLOW}--- Auditing Configured Package Repositories (Official vs Unofficial/Third-Party) ---${NC}"
+
+    local total_repos=0
+    local unofficial_repos=0
+    local repo_findings=""
+
+    if [[ "${TOOL_FOUND['apt-get']}" -eq 1 || -d "/etc/apt" ]]; then
+        local apt_sources_files=()
+        [[ -f "/etc/apt/sources.list" ]] && apt_sources_files+=("/etc/apt/sources.list")
+        if [[ -d "/etc/apt/sources.list.d" ]]; then
+            while read -r sfile; do
+                [[ -f "$sfile" ]] && apt_sources_files+=("$sfile")
+            done < <(find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) 2>/dev/null)
+        fi
+
+        echo -e "${CYAN}Discovered APT Repositories (${#apt_sources_files[@]} config file(s)):${NC}"
+        local official_pattern="debian\.org|ubuntu\.com|kali\.org|raspbian\.org|mint\.com"
+
+        for sf in "${apt_sources_files[@]}"; do
+            while read -r rline; do
+                [[ -z "$rline" || "$rline" =~ ^\s*# ]] && continue
+                if [[ "$rline" =~ ^\s*(deb|deb-src)\s+|^\s*URIs:\s* ]]; then
+                    ((total_repos++))
+                    local repo_url
+                    repo_url=$(echo "$rline" | grep -oE '(https?|ftp)://[^ "]+' | head -n 1)
+                    [[ -z "$repo_url" ]] && repo_url="$rline"
+
+                    local domain
+                    domain=$(echo "$repo_url" | awk -F/ '{print $3}')
+                    [[ -z "$domain" ]] && domain="$repo_url"
+
+                    if [[ "$domain" =~ $official_pattern ]]; then
+                        echo -e "  [${GREEN}OFFICIAL${NC}] ${CYAN}${domain}${NC} -> ${repo_url}"
+                    else
+                        ((unofficial_repos++))
+                        echo -e "  [${RED}UNOFFICIAL / THIRD-PARTY${NC}] ${YELLOW}${domain}${NC} -> ${repo_url}"
+                        repo_findings+="  - Unofficial Repo (${domain}): ${repo_url}\n"
+                    fi
+                fi
+            done < "$sf"
+        done
+
+    elif [[ "${TOOL_FOUND['dnf']}" -eq 1 || -d "/etc/yum.repos.d" ]]; then
+        echo -e "${CYAN}Discovered DNF/YUM Repositories (/etc/yum.repos.d/*.repo):${NC}"
+        local official_dnf_pattern="fedoraproject\.org|redhat\.com|centos\.org|almalinux\.org|rockylinux\.org"
+
+        for rfile in /etc/yum.repos.d/*.repo; do
+            [[ -f "$rfile" ]] || continue
+            local repo_id base_url enabled
+            repo_id=$(basename "$rfile" .repo)
+            base_url=$(grep -Ei '^\s*(baseurl|metalink|mirrorlist)\s*=' "$rfile" 2>/dev/null | head -n 1 | cut -d= -f2 | tr -d ' ')
+            enabled=$(grep -Ei '^\s*enabled\s*=' "$rfile" 2>/dev/null | tail -n 1 | cut -d= -f2 | tr -d ' ')
+
+            [[ "$enabled" == "0" ]] && continue
+            ((total_repos++))
+
+            local domain
+            domain=$(echo "$base_url" | awk -F/ '{print $3}')
+            [[ -z "$domain" ]] && domain="$repo_id"
+
+            if [[ "$domain" =~ $official_dnf_pattern ]]; then
+                echo -e "  [${GREEN}OFFICIAL${NC}] ${CYAN}${repo_id}${NC} -> ${base_url:-$rfile}"
+            else
+                ((unofficial_repos++))
+                echo -e "  [${RED}UNOFFICIAL / THIRD-PARTY${NC}] ${YELLOW}${repo_id}${NC} -> ${base_url:-$rfile}"
+                repo_findings+="  - Unofficial DNF Repo (${repo_id}): ${base_url:-$rfile}\n"
+            fi
+        done
+    fi
+
+    if [[ "$unofficial_repos" -gt 0 ]]; then
+        log_warn "Discovered ${unofficial_repos} unofficial/third-party package repositories:\n$repo_findings"
+    else
+        log_pass "Repository audit completed: All ${total_repos} configured package repositories belong to official distribution sources."
+    fi
+    echo ""
+}
+
+audit_package_repositories
+
 RUNNING_KERNEL=$(uname -r)
 echo -e "Current running kernel: ${CYAN}${RUNNING_KERNEL}${NC}"
 
