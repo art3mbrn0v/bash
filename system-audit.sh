@@ -1602,12 +1602,12 @@ audit_passwd_group_shadow() {
             local ext_urls=""
             if [[ "$FETCH_EXTERNAL_PASSWORDS" == true && ${#EXTERNAL_PASSWORD_LIST_URLS[@]} -gt 0 ]]; then
                 ext_urls=$(IFS=","; echo "${EXTERNAL_PASSWORD_LIST_URLS[*]}")
-                echo -e "  Fetching external password databases from GitHub repositories..."
+                echo -e "  Fetching external password databases from GitHub repositories (60s timeout)..."
             fi
 
             local py_result
-            py_result=$(run_sudo "$py_cmd" - "$sys_hostname" "$ext_urls" << 'PYEOF' 2>/dev/null
-import sys, ctypes, ctypes.util, os
+            py_result=$(run_sudo timeout 65s "$py_cmd" - "$sys_hostname" "$ext_urls" << 'PYEOF' 2>/dev/null
+import sys, ctypes, ctypes.util, os, time
 try:
     import urllib.request
 except ImportError:
@@ -1638,22 +1638,34 @@ if hostname:
 
 if ext_urls_str and urllib:
     urls = [u.strip() for u in ext_urls_str.split(',') if u.strip()]
+    dl_start = time.time()
+    MAX_DL_TIME = 60
+
     for url in urls:
+        elapsed = time.time() - dl_start
+        if elapsed >= MAX_DL_TIME:
+            print(f"FETCH_TIMEOUT:Download time limit reached ({int(elapsed)}s >= {MAX_DL_TIME}s). Interrupted GitHub download section.")
+            break
+
+        fname = url.split('/')[-1]
+        t0 = time.time()
+        rem_time = max(1, int(MAX_DL_TIME - elapsed))
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                lines = resp.read().decode('utf-8', errors='ignore').splitlines()
+            with urllib.request.urlopen(req, timeout=rem_time) as resp:
+                content = resp.read().decode('utf-8', errors='ignore')
+                lines = content.splitlines()
                 added = 0
                 for line in lines:
                     p = line.strip()
                     if p and not p.startswith('#'):
                         common_passwords.append(p)
                         added += 1
-                fname = url.split('/')[-1]
-                print(f"FETCHED:{fname}:{added}")
+                t_taken = round(time.time() - t0, 2)
+                print(f"FETCHED:{fname}:{added}:{t_taken}s")
         except Exception as err:
-            fname = url.split('/')[-1]
-            print(f"FETCH_ERR:{fname}:{err}")
+            t_taken = round(time.time() - t0, 2)
+            print(f"FETCH_ERR:{fname}:{err}:{t_taken}s")
 
 weak_found = []
 algo_counts = {}
@@ -1696,15 +1708,20 @@ PYEOF
             if [[ -n "$py_result" ]]; then
                 while read -r line; do
                     if [[ "$line" =~ ^FETCHED: ]]; then
-                        local fname count
+                        local fname count t_sec
                         fname=$(echo "$line" | cut -d: -f2)
                         count=$(echo "$line" | cut -d: -f3)
-                        echo -e "  - ${GREEN}✓${NC} Loaded ${CYAN}${count}${NC} passwords from GitHub (${fname})"
+                        t_sec=$(echo "$line" | cut -d: -f4)
+                        echo -e "  - ${GREEN}✓ [DOWNLOADED]${NC} Downloaded ${CYAN}${fname}${NC} (${count} passwords, ${t_sec}) from GitHub"
                     elif [[ "$line" =~ ^FETCH_ERR: ]]; then
                         local fname err
                         fname=$(echo "$line" | cut -d: -f2)
                         err=$(echo "$line" | cut -d: -f3)
-                        echo -e "  - ${YELLOW}!${NC} Failed to fetch GitHub password list (${fname}): ${err}"
+                        echo -e "  - ${YELLOW}! [DOWNLOAD ERROR]${NC} Failed to fetch ${fname} from GitHub: ${err}"
+                    elif [[ "$line" =~ ^FETCH_TIMEOUT: ]]; then
+                        local timeout_msg
+                        timeout_msg=$(echo "$line" | cut -d: -f2)
+                        log_warn "GitHub download section timed out: ${timeout_msg}"
                     elif [[ "$line" =~ ^TOTAL_PASSWORDS: ]]; then
                         local total_pass
                         total_pass=$(echo "$line" | cut -d: -f2)
