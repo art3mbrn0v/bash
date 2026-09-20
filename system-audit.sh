@@ -227,18 +227,21 @@ apply_runbook_permission_remediations() {
 }
 
 # --- Tool Cache & Pre-Flight Dependency Inspection ---
+# Tool cache arrays for tracking availability and binary paths
 declare -A TOOL_BIN
 declare -A TOOL_FOUND
 
+# List of critical system and security tools checked during pre-flight
 TOOLS_TO_CHECK=(
     "sudo" "systemctl" "journalctl" "ss" "sysctl" "ssh-keygen" 
     "crontab" "ip" "df" "awk" "grep" "sed" "find" "clamscan" 
-    "freshclam" "rkhunter" "trivy" "nmcli" "nmap" "docker" "podman"
+    "freshclam" "chkrootkit" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
     "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
     "curl" "wget" "cryptsetup" "unhide"
 )
 
+# Inspect system for required tools and auto-install missing security packages
 check_all_dependencies() {
     echo -e "${YELLOW}=== Pre-Flight Security Tools & Dependency Check ===${NC}"
     local missing_tools=()
@@ -254,13 +257,14 @@ check_all_dependencies() {
             TOOL_FOUND["$tool"]=0
             printf "  [${YELLOW}!${NC}] %-15s : ${YELLOW}NOT installed${NC}\n" "$tool"
             case "$tool" in
-                clamscan|freshclam|rkhunter|trivy|nmap|lynis|needrestart|debsums)
+                clamscan|freshclam|chkrootkit|trivy|nmap|lynis|needrestart|debsums)
                     missing_tools+=("$tool")
                     ;;
             esac
         fi
     done
 
+    # Automatically install missing recommended security tools if enabled
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         if [[ "$INSTALL_MISSING_PKGS" == true ]]; then
             echo -e "\n${YELLOW}=== Auto-Installing Missing Security Tools & Restarting Services ===${NC}"
@@ -272,8 +276,8 @@ check_all_dependencies() {
                     needrestart)
                         install_pkg_and_restart_service "needrestart" ""
                         ;;
-                    rkhunter)
-                        install_pkg_and_restart_service "rkhunter" ""
+                    chkrootkit)
+                        install_pkg_and_restart_service "chkrootkit" ""
                         ;;
                     trivy)
                         install_pkg_and_restart_service "trivy" ""
@@ -290,7 +294,7 @@ check_all_dependencies() {
             elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
                 echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install ${missing_tools[*]}${NC}"
             fi
-            echo -e "  Tip: Run with ${CYAN}--install-packages${NC} or ${CYAN}-i${NC} to auto-install missing tools & start/restart services."
+            echo -e "  Tip: Set INSTALL_MISSING_PKGS=true to auto-install missing tools & start services."
         fi
     fi
     echo ""
@@ -298,6 +302,7 @@ check_all_dependencies() {
 
 check_all_dependencies
 
+# Apply automatic security fixes and permission hardening
 if [[ "$AUTO_FIX" == true ]]; then
     echo -e "${YELLOW}=== Running in Auto-Fix Mode (--fix enabled) ===${NC}"
     chmod 700 "$HOME/.ssh" 2>/dev/null
@@ -313,13 +318,13 @@ if [[ "$AUTO_FIX" == true ]]; then
         fi
     done
 
-    # Runbook-Based Automatic Permission & System Remediations (~/Labolatory/runbooks/*.md)
+    # Runbook-Based Automatic Permission & System Remediations
     apply_runbook_permission_remediations
 
     echo -e "${GREEN}✓ Auto-fix completed: Permissions, safety aliases & runbook fixes applied.${NC}\n"
 fi
 
-# Helper function to update security databases before audit
+# Update security tool databases and vulnerability definitions before audit
 update_security_databases() {
     echo -e "${YELLOW}--- Updating Security & Audit Tool Databases ---${NC}"
 
@@ -334,11 +339,6 @@ update_security_databases() {
     if [[ "${TOOL_FOUND['freshclam']}" -eq 1 ]]; then
         echo -n "Updating ClamAV virus signatures... "
         run_sudo "${TOOL_BIN['freshclam']}" 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Updated or locked by daemon${NC}"
-    fi
-
-    if [[ "${TOOL_FOUND['rkhunter']}" -eq 1 ]]; then
-        echo -n "Updating rkhunter rootkit definitions... "
-        run_sudo "${TOOL_BIN['rkhunter']}" --update 2>/dev/null && echo -e "${GREEN}✓ Done${NC}" || echo -e "${YELLOW}Completed/Skipped${NC}"
     fi
 
     if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
@@ -676,38 +676,56 @@ audit_network_security_and_tunnels() {
 
 audit_network_security_and_tunnels
 
-# 6. Antivirus & Rootkit Audit (ClamAV / rkhunter)
-section "6/20" "Antivirus & Rootkit Audit (ClamAV / rkhunter)..."
-if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
-    if systemctl is-active --quiet clamav-freshclam; then
-        log_pass "clamav-freshclam service is active."
-    elif systemctl list-unit-files 2>/dev/null | grep -q "^clamav-freshclam\.service"; then
-        log_warn "clamav-freshclam service is installed but inactive."
-        if [[ "$AUTO_RESTART_SERVICES" == true && "$AUTO_FIX" == true ]]; then
-            restart_service "clamav-freshclam" "activating antivirus signature update daemon"
+# 6. Antivirus & Rootkit Audit (ClamAV / chkrootkit)
+section "6/20" "Antivirus & Rootkit Audit (ClamAV / chkrootkit)..."
+
+audit_antivirus_and_rootkits() {
+    if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
+        if systemctl is-active --quiet clamav-freshclam; then
+            log_pass "clamav-freshclam service is active."
+        elif systemctl list-unit-files 2>/dev/null | grep -q "^clamav-freshclam\.service"; then
+            log_warn "clamav-freshclam service is installed but inactive."
+            if [[ "$AUTO_RESTART_SERVICES" == true && "$AUTO_FIX" == true ]]; then
+                restart_service "clamav-freshclam" "activating antivirus signature update daemon"
+            fi
         fi
     fi
-fi
 
-if [[ "${TOOL_FOUND['clamscan']}" -eq 1 ]]; then
-    echo "Scanning active system binary paths for malware..."
-    CLAM_OUT=$(run_sudo "${TOOL_BIN['clamscan']}" -r --exclude-dir="^/sys" --exclude-dir="^/dev" --exclude-dir="^/proc" /bin /sbin /usr/bin /usr/sbin 2>/dev/null | grep -E "Infected|Summary|FOUND")
-    if [[ "$CLAM_OUT" =~ "FOUND" || "$CLAM_OUT" =~ "Infected files: "[1-9] ]]; then
-        log_crit "ClamAV malware threats found!\n$CLAM_OUT"
+    if [[ "${TOOL_FOUND['clamscan']}" -eq 1 ]]; then
+        echo "Scanning active system binary paths for malware..."
+        local clam_out
+        clam_out=$(run_sudo "${TOOL_BIN['clamscan']}" -r --exclude-dir="^/sys" --exclude-dir="^/dev" --exclude-dir="^/proc" /bin /sbin /usr/bin /usr/sbin 2>/dev/null | grep -E "Infected|Summary|FOUND")
+        if [[ "$clam_out" =~ "FOUND" || "$clam_out" =~ "Infected files: "[1-9] ]]; then
+            log_crit "ClamAV malware threats found!\n$clam_out"
+        else
+            log_pass "ClamAV scan completed: No threats found."
+        fi
     else
-        log_pass "ClamAV scan completed: No threats found."
+        echo -e "${YELLOW}ClamAV (clamscan) not installed.${NC}"
     fi
-else
-    echo -e "${YELLOW}ClamAV (clamscan) not installed.${NC}"
-fi
 
-if [[ "${TOOL_FOUND['rkhunter']}" -eq 1 ]]; then
-    echo "Running Rootkit Detection (rkhunter)..."
-    run_sudo "${TOOL_BIN['rkhunter']}" --check --sk --quiet 2>/dev/null
-    log_pass "rkhunter check completed."
-else
-    echo -e "${YELLOW}rkhunter not installed.${NC}"
-fi
+    if [[ "${TOOL_FOUND['chkrootkit']}" -eq 1 ]]; then
+        echo -e "${CYAN}Running Rootkit Detection (chkrootkit)...${NC}"
+        local chk_raw chk_infected
+        chk_raw=$(run_sudo "${TOOL_BIN['chkrootkit']}" -q 2>/dev/null)
+        # Filter for actual INFECTED or VULNERABLE findings, excluding generic empty warning headers
+        chk_infected=$(echo "$chk_raw" | grep -Ei "INFECTED|VULNERABLE" | grep -v "not infected")
+
+        if [[ -n "$chk_infected" ]]; then
+            log_crit "chkrootkit detected potential rootkit signatures:\n$chk_infected"
+        else
+            log_pass "chkrootkit scan completed: No rootkit signatures detected."
+        fi
+    elif [[ "${TOOL_FOUND['rkhunter']}" -eq 1 ]]; then
+        echo -e "${CYAN}Running Rootkit Detection (rkhunter)...${NC}"
+        run_sudo "${TOOL_BIN['rkhunter']}" --check --sk --quiet 2>/dev/null || true
+        log_pass "rkhunter check completed."
+    else
+        echo -e "${YELLOW}Neither chkrootkit nor rkhunter installed.${NC}"
+    fi
+}
+
+audit_antivirus_and_rootkits
 
 # 7. Filesystem Directory Permissions, Container & Lynis Security Audit
 section "7/20" "Filesystem Directory Permissions, Container & Lynis Security Audit..."
@@ -1010,14 +1028,14 @@ if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
     echo -e "\n${CYAN}Running Trivy Container/Filesystem Audit...${NC}"
     "${TOOL_BIN['trivy']}" fs --severity HIGH,CRITICAL --format table "${SCRIPT_DIR}" 2>/dev/null
 else
-    echo -e "${YELLOW}Trivy not installed. (Install trivy for vulnerability scanning of code/containers).${NC}"
+    echo -e "${YELLOW}Trivy not installed - install trivy for vulnerability scanning of code/containers.${NC}"
 fi
 
 if [[ "${TOOL_FOUND['lynis']}" -eq 1 ]]; then
     echo -e "\n${CYAN}Running Lynis System Audit Summary...${NC}"
     run_sudo "${TOOL_BIN['lynis']}" audit system --quick --no-colors 2>/dev/null | grep -E "Hardening index|Warnings|Suggestions"
 else
-    echo -e "${YELLOW}Lynis security auditor not installed. (Install lynis for deep security scoring).${NC}"
+    echo -e "${YELLOW}Lynis security auditor not installed - install lynis for deep security scoring.${NC}"
 fi
 
 # 8. System Log, User Logins & Auth Audit
@@ -2081,7 +2099,7 @@ if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     fi
 
     echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
-    RECOMMENDED_PKGS=("fail2ban" "firewalld" "audit" "clamav" "rkhunter" "trivy" "policycoreutils" "crypto-policies")
+    RECOMMENDED_PKGS=("fail2ban" "firewalld" "audit" "clamav" "chkrootkit" "trivy" "policycoreutils" "crypto-policies")
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if rpm -q "$pkg" &> /dev/null; then
             PKG_UPDATE=$(dnf check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\.")
@@ -2115,7 +2133,7 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     fi
 
     echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
-    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "rkhunter" "trivy" "needrestart" "debsums" "lynis")
+    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "chkrootkit" "trivy" "needrestart" "debsums" "lynis")
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
             PKG_UPDATE=$(apt list --upgradable 2>/dev/null | grep -E "^${pkg}/")
