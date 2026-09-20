@@ -131,22 +131,25 @@ sysupdate() {
         echo -e "${BLUE}===> Start sudo-session...${NC}"
         sudo -v || return 1
 
-        echo -e "${GREEN}---- 1. APT Update & Upgrade ----${NC}"
-        sudo apt update && sudo apt list --upgradable && sudo apt upgrade -y && sudo apt autoremove -y && sudo apt autoclean || return 1
+        echo -e "${GREEN}---- 1. APT Update & Full-Upgrade ----${NC}"
+        sudo apt update && sudo apt list --upgradable && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo apt autoclean || return 1
 
-        echo -e "${GREEN}---- 2. AGY Update ----${NC}"
+        echo -e "${GREEN}---- 2. Flatpak Update & Cleanup ----${NC}"
+        flatpak update -y && flatpak uninstall --unused -y
+
+        echo -e "${GREEN}---- 3. AGY Update ----${NC}"
         agy update
 
-        echo -e "${GREEN}---- 3. ClamAV Update ----${NC}"
+        echo -e "${GREEN}---- 4. ClamAV Update ----${NC}"
         sudo systemctl stop clamav-freshclam
 	sleep 5
         sudo freshclam
         sudo systemctl start clamav-freshclam
 
-        echo -e "${GREEN}---- 4. Rust Update ----${NC}"
+        echo -e "${GREEN}---- 5. Rust Update ----${NC}"
         rustup update
 
-        echo -e "${GREEN}---- 5. UpdateDB ----${NC}"
+        echo -e "${GREEN}---- 6. UpdateDB ----${NC}"
         sudo updatedb
 
         echo -e "${BLUE}=== Done ===${NC}"
