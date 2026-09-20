@@ -238,7 +238,7 @@ TOOLS_TO_CHECK=(
     "freshclam" "chkrootkit" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
     "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
-    "curl" "wget" "cryptsetup" "unhide"
+    "curl" "wget" "cryptsetup" "unhide" "lsusb" "lsblk" "lspci" "bluetoothctl"
 )
 
 # Inspect system for required tools and auto-install missing security packages
@@ -2763,8 +2763,112 @@ audit_dns_hosts() {
 }
 audit_dns_hosts
 
-# 20. Wi-Fi Access Points, Security & Local Network Hosts Audit
-section "20/20" "Auditing Wi-Fi Networks, Connected AP Security & Local Network Hosts..."
+# 20. Connected Hardware Devices, Wi-Fi Networks & Local Network Hosts Audit
+section "20/20" "Auditing Connected Hardware Devices, Wi-Fi Security & Local Network Hosts..."
+
+audit_connected_devices() {
+    echo -e "${YELLOW}--- Connected Hardware Devices & Removable Storage Media Audit ---${NC}"
+
+    # 1. USB Connected Devices Audit (lsusb / sysfs)
+    echo -e "${CYAN}1. Connected USB Devices (lsusb):${NC}"
+    if command -v lsusb &>/dev/null; then
+        local usb_devices
+        usb_devices=$(lsusb 2>/dev/null)
+        if [[ -n "$usb_devices" ]]; then
+            echo "$usb_devices" | sed 's/^/  - /'
+            local usb_count
+            usb_count=$(echo "$usb_devices" | wc -l)
+            log_pass "Discovered ${usb_count} connected USB device(s)."
+
+            # Detect potential suspicious USB HID / Wireless / Storage dongles
+            local suspicious_usb
+            suspicious_usb=$(echo "$usb_devices" | grep -Ei "rubber|ducky|badusb|keysmith|keystroke|wireless|sniffer")
+            if [[ -n "$suspicious_usb" ]]; then
+                log_crit "POTENTIAL SUSPICIOUS USB DEVICE DETECTED:\n$suspicious_usb"
+            fi
+        else
+            echo "No USB devices detected."
+        fi
+    elif [[ -d "/sys/bus/usb/devices" ]]; then
+        local sys_usb_count
+        sys_usb_count=$(find /sys/bus/usb/devices -maxdepth 1 -type l 2>/dev/null | wc -l)
+        echo -e "  Discovered ${CYAN}${sys_usb_count}${NC} USB device nodes in /sys/bus/usb/devices."
+    fi
+
+    # 2. Block Storage & Removable Drives Audit (lsblk)
+    echo -e "\n${CYAN}2. Block Storage Devices & Removable Media (lsblk):${NC}"
+    if command -v lsblk &>/dev/null; then
+        local block_devs
+        block_devs=$(lsblk -o NAME,SIZE,TYPE,TRAN,RM,MOUNTPOINT,RO 2>/dev/null)
+        if [[ -n "$block_devs" ]]; then
+            echo "$block_devs" | sed 's/^/  /'
+            
+            # Check for mounted removable media (USB drives, SD cards)
+            local removable_mounts
+            removable_mounts=$(lsblk -rn -o NAME,TRAN,RM,MOUNTPOINT 2>/dev/null | awk '$3 == "1" || $2 == "usb" {if ($4 != "") print $1, $4}')
+            if [[ -n "$removable_mounts" ]]; then
+                log_warn "Mounted removable storage media detected:\n$removable_mounts"
+                
+                # Check mount security options (noexec, nosuid, nodev)
+                while read -r dev mpoint; do
+                    [[ -z "$mpoint" ]] && continue
+                    local mopts
+                    mopts=$(findmnt -n -o OPTIONS "$mpoint" 2>/dev/null)
+                    if [[ "$mopts" != *noexec* || "$mopts" != *nosuid* ]]; then
+                        log_warn "Removable media mounted at '${mpoint}' lacks 'noexec' or 'nosuid' mount flags! (Current options: ${mopts:-default})"
+                    else
+                        log_pass "Removable media mounted at '${mpoint}' has secure mount options (${mopts})."
+                    fi
+                done <<< "$removable_mounts"
+            else
+                log_pass "No mounted removable storage drives (USB/SD cards) detected."
+            fi
+        fi
+    fi
+
+    # 3. PCI Hardware Controllers Audit (lspci)
+    echo -e "\n${CYAN}3. PCI Hardware Controllers (lspci):${NC}"
+    if command -v lspci &>/dev/null; then
+        local pci_summary
+        pci_summary=$(lspci 2>/dev/null | grep -Ei "VGA|Network|Ethernet|Wireless|Thunderbolt|RAID|SATA|NVMe" | head -n 10)
+        if [[ -n "$pci_summary" ]]; then
+            echo "$pci_summary" | sed 's/^/  - /'
+        fi
+    fi
+
+    # 4. Bluetooth Controller & Discoverability Audit
+    echo -e "\n${CYAN}4. Bluetooth Adapter & Pairing Status:${NC}"
+    if command -v bluetoothctl &>/dev/null; then
+        local bt_status
+        bt_status=$(bluetoothctl show 2>/dev/null)
+        if [[ -n "$bt_status" ]]; then
+            local bt_power bt_disc
+            bt_power=$(echo "$bt_status" | grep -i "Powered:" | awk '{print $2}')
+            bt_disc=$(echo "$bt_status" | grep -i "Discoverable:" | awk '{print $2}')
+            echo -e "  Bluetooth Powered     : ${CYAN}${bt_power:-unknown}${NC}"
+            echo -e "  Bluetooth Discoverable: ${CYAN}${bt_disc:-unknown}${NC}"
+
+            if [[ "$bt_disc" == "yes" ]]; then
+                log_warn "Bluetooth adapter is DISCOVERABLE to nearby un-paired devices!"
+            else
+                log_pass "Bluetooth adapter is non-discoverable."
+            fi
+        else
+            echo "Bluetooth controller inactive or not present."
+        fi
+    elif command -v hciconfig &>/dev/null; then
+        local hci_info
+        hci_info=$(hciconfig 2>/dev/null | grep -E "hci[0-9]|UP|RUNNING|ISCAN|PSCAN")
+        if [[ -n "$hci_info" ]]; then
+            echo "$hci_info" | sed 's/^/  - /'
+        fi
+    else
+        echo "Bluetooth stack/tools not present."
+    fi
+    echo ""
+}
+
+audit_connected_devices
 
 audit_wifi_and_network_hosts() {
     echo -e "${YELLOW}--- 1. Primary Network Interface & Subnet Info ---${NC}"
