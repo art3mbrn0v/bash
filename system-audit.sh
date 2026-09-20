@@ -238,7 +238,7 @@ TOOLS_TO_CHECK=(
     "freshclam" "chkrootkit" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
     "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
-    "curl" "wget" "cryptsetup" "unhide" "lsusb" "lsblk" "lspci" "bluetoothctl"
+    "curl" "wget" "cryptsetup" "unhide" "lsusb" "lsblk" "lspci" "bluetoothctl" "mokutil"
 )
 
 # Inspect system for required tools and auto-install missing security packages
@@ -1381,8 +1381,90 @@ audit_and_clean_user_cache() {
 
 audit_and_clean_user_cache
 
-# 10. Privilege, Account, Group & Shadow Security Audit
-section "10/20" "Auditing /etc/passwd, /etc/group, /etc/shadow & Privilege Misconfigurations..."
+audit_user_privileges_groups_and_login_counts() {
+    echo -e "\n${YELLOW}--- User Accounts, Privileges, Group Memberships & Login Frequency Audit ---${NC}"
+
+    local interactive_users=0
+    local privileged_users_count=0
+
+    # Track per-user login counts from wtmp / last logs
+    declare -A USER_LOGIN_COUNTS
+    declare -A USER_LAST_LOGIN
+
+    if [[ "${TOOL_FOUND['last']}" -eq 1 ]]; then
+        while read -r line; do
+            [[ -z "$line" || "$line" =~ ^wtmp|^$ ]] && continue
+            local uname
+            uname=$(echo "$line" | awk '{print $1}')
+            
+            if [[ -n "$uname" ]]; then
+                ((USER_LOGIN_COUNTS["$uname"]++))
+                if [[ -z "${USER_LAST_LOGIN["$uname"]}" ]]; then
+                    USER_LAST_LOGIN["$uname"]=$(echo "$line" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')
+                fi
+            fi
+        done < <("${TOOL_BIN['last']}" -a 2>/dev/null | grep -v 'system boot' | grep -v 'wtmp begins')
+    fi
+
+    echo -e "${CYAN}Per-User Account Details (UID, Primary/Secondary Groups, Privileges, Login Count):${NC}"
+
+    while IFS=: read -r username password uid gid gecos home shell; do
+        # Filter for interactive users (UID >= 1000 or UID 0 / root or accounts with login shells)
+        if [[ "$uid" -ge 1000 || "$uid" -eq 0 || "$shell" =~ (bash|zsh|sh|csh|tcsh|ksh)$ ]]; then
+            ((interactive_users++))
+            
+            # Retrieve all groups user belongs to
+            local user_groups=""
+            if command -v id &>/dev/null; then
+                user_groups=$(id -Gn "$username" 2>/dev/null | tr ' ' ',')
+            fi
+            [[ -z "$user_groups" ]] && user_groups="GID:${gid}"
+
+            # Retrieve login count from last logs
+            local login_cnt="${USER_LOGIN_COUNTS["$username"]:-0}"
+            local last_log_info="${USER_LAST_LOGIN["$username"]:-No recent logins recorded}"
+
+            # Privilege assessment
+            local is_privileged=false
+            local priv_details=""
+            if [[ "$uid" -eq 0 ]]; then
+                is_privileged=true
+                priv_details="[UID 0 ROOT]"
+            fi
+            if [[ "$user_groups" =~ \b(sudo|wheel|admin)\b ]]; then
+                is_privileged=true
+                priv_details+=" [SUDOERS ACCESS]"
+            fi
+            if [[ "$user_groups" =~ \b(docker|containerd|podman)\b ]]; then
+                is_privileged=true
+                priv_details+=" [DOCKER/CONTAINER HOST ACCESS]"
+            fi
+            if [[ "$user_groups" =~ \b(shadow|disk|kmem)\b ]]; then
+                is_privileged=true
+                priv_details+=" [RAW DISK/SHADOW ACCESS]"
+            fi
+
+            if [[ "$is_privileged" == true ]]; then
+                ((privileged_users_count++))
+                echo -e "  - User: ${CYAN}${username}${NC} (UID: ${uid}, Shell: ${shell})"
+                echo -e "    Groups       : ${YELLOW}${user_groups}${NC}"
+                echo -e "    Privileges   : ${RED}${priv_details}${NC}"
+                echo -e "    Total Logins : ${CYAN}${login_cnt} session(s)${NC} (Last: ${last_log_info})"
+            else
+                echo -e "  - User: ${CYAN}${username}${NC} (UID: ${uid}, Shell: ${shell})"
+                echo -e "    Groups       : ${GREEN}${user_groups}${NC}"
+                echo -e "    Privileges   : Standard User"
+                echo -e "    Total Logins : ${CYAN}${login_cnt} session(s)${NC} (Last: ${last_log_info})"
+            fi
+        fi
+    done < /etc/passwd
+
+    if [[ "$privileged_users_count" -gt 0 ]]; then
+        log_warn "Discovered ${privileged_users_count} privileged/administrative account(s) out of ${interactive_users} total user account(s)."
+    else
+        log_pass "User privileges audit completed: ${interactive_users} interactive user account(s) evaluated."
+    fi
+}
 
 audit_passwd_group_shadow() {
     # --- 10.1 File Permissions & Ownership Audit ---
@@ -1593,8 +1675,11 @@ audit_passwd_group_shadow() {
         fi
     done
 
-    # --- 10.4 /etc/shadow Password Security & Weak Password Audit ---
-    echo -e "\n${YELLOW}--- 10.4 /etc/shadow Password Security & Weak Password Audit ---${NC}"
+    # --- 10.4 User Accounts, Privileges, Group Memberships & Login Frequency Audit ---
+    audit_user_privileges_groups_and_login_counts
+
+    # --- 10.5 /etc/shadow Password Security & Weak Password Audit ---
+    echo -e "\n${YELLOW}--- 10.5 /etc/shadow Password Security & Weak Password Audit ---${NC}"
     
     if ! run_sudo test -r /etc/shadow 2>/dev/null; then
         log_warn "Cannot read /etc/shadow (root/sudo required). Skipping shadow hash & weak password analysis."
@@ -1620,11 +1705,11 @@ audit_passwd_group_shadow() {
             local ext_urls=""
             if [[ "$FETCH_EXTERNAL_PASSWORDS" == true && ${#EXTERNAL_PASSWORD_LIST_URLS[@]} -gt 0 ]]; then
                 ext_urls=$(IFS=","; echo "${EXTERNAL_PASSWORD_LIST_URLS[*]}")
-                echo -e "  Fetching external password databases from GitHub repositories (60s timeout)..."
+                echo -e "  Fetching external password databases from GitHub repositories (180s timeout)..."
             fi
 
             local py_result
-            py_result=$(run_sudo timeout 65s "$py_cmd" - "$sys_hostname" "$ext_urls" << 'PYEOF' 2>/dev/null
+            py_result=$(run_sudo timeout 185s "$py_cmd" - "$sys_hostname" "$ext_urls" << 'PYEOF' 2>/dev/null
 import sys, ctypes, ctypes.util, os, time
 try:
     import urllib.request
@@ -1657,7 +1742,7 @@ if hostname:
 if ext_urls_str and urllib:
     urls = [u.strip() for u in ext_urls_str.split(',') if u.strip()]
     dl_start = time.time()
-    MAX_DL_TIME = 60
+    MAX_DL_TIME = 180
 
     for url in urls:
         elapsed = time.time() - dl_start
@@ -2702,8 +2787,177 @@ audit_container_security() {
 }
 audit_container_security
 
-# 18. Kernel Security Hardening (Sysctl Parameters Audit)
-section "18/20" "Auditing Kernel Security Hardening (sysctl Parameters)..."
+# 18. Kernel Security Hardening & GRUB Bootloader Audit
+section "18/20" "Auditing Kernel Hardening (sysctl) & GRUB Bootloader Configuration..."
+
+audit_grub_bootloader() {
+    echo -e "${YELLOW}--- Bootloader & GRUB Security Configuration Audit ---${NC}"
+
+    local grub_cfg_files=(
+        "/boot/grub/grub.cfg"
+        "/boot/grub2/grub.cfg"
+        "/boot/efi/EFI/debian/grub.cfg"
+        "/boot/efi/EFI/ubuntu/grub.cfg"
+        "/boot/efi/EFI/redhat/grub.cfg"
+        "/boot/efi/EFI/centos/grub.cfg"
+        "/boot/efi/EFI/fedora/grub.cfg"
+    )
+    local default_grub="/etc/default/grub"
+    local found_grub_cfg=""
+
+    # 18.1 GRUB Config File Discovery & Permissions Audit
+    for cfg in "${grub_cfg_files[@]}"; do
+        if [[ -f "$cfg" ]]; then
+            found_grub_cfg="$cfg"
+            local owner_group perm
+            owner_group=$(stat -c "%U:%G" "$cfg" 2>/dev/null)
+            perm=$(stat -c "%a" "$cfg" 2>/dev/null)
+
+            echo -e "  Found GRUB config file      : ${CYAN}${cfg}${NC} (Perms: ${perm}, Owner: ${owner_group})"
+
+            if [[ "$owner_group" != "root:root" && "$owner_group" != "root:wheel" ]]; then
+                log_warn "Insecure ownership on ${cfg}: owned by '${owner_group}' (Expected: root:root)."
+            fi
+
+            if [[ "$perm" =~ ^(600|700|400|440)$ ]]; then
+                log_pass "GRUB config permissions verified (${cfg}: ${perm})."
+            else
+                log_warn "Insecure permissions on ${cfg} (${perm})! GRUB config is readable by non-root users. Recommended permissions: 600 or 700."
+            fi
+            break
+        fi
+    done
+
+    if [[ -z "$found_grub_cfg" ]]; then
+        if [[ -d "/sys/firmware/efi" ]]; then
+            echo -e "  ${YELLOW}No standard GRUB configuration file found at /boot/grub/grub.cfg. System may use systemd-boot or EFI stub.${NC}"
+        else
+            echo -e "  ${YELLOW}No GRUB configuration file found in standard /boot locations.${NC}"
+        fi
+    fi
+
+    if [[ -f "$default_grub" ]]; then
+        local def_perm def_owner
+        def_perm=$(stat -c "%a" "$default_grub" 2>/dev/null)
+        def_owner=$(stat -c "%U:%G" "$default_grub" 2>/dev/null)
+        echo -e "  GRUB environment config     : ${CYAN}${default_grub}${NC} (Perms: ${def_perm}, Owner: ${def_owner})"
+        if [[ "$def_perm" =~ ^(644|600|400)$ ]]; then
+            log_pass "/etc/default/grub permissions verified (${def_perm})."
+        else
+            log_warn "Insecure permissions on ${default_grub} (${def_perm}). Recommended: 644 or 600."
+        fi
+    fi
+
+    # 18.2 GRUB Password Protection Audit
+    echo -e "\n${YELLOW}--- GRUB Password Protection & Bootloader Authentication Audit ---${NC}"
+    local password_protected=false
+    if [[ -n "$found_grub_cfg" && -r "$found_grub_cfg" ]]; then
+        if grep -qE "password_pbkdf2|password " "$found_grub_cfg" 2>/dev/null; then
+            password_protected=true
+        fi
+    fi
+
+    if [[ "$password_protected" == false && -d "/etc/grub.d" ]]; then
+        if grep -rqE "password_pbkdf2|password " /etc/grub.d/ 2>/dev/null; then
+            password_protected=true
+        fi
+    fi
+
+    if [[ "$password_protected" == true ]]; then
+        log_pass "GRUB password protection is configured (PBKDF2/password protection active)."
+    else
+        log_warn "GRUB bootloader is NOT password protected! Users with physical or console access can modify boot options or gain root shell."
+    fi
+
+    # 18.3 Recovery Mode & Timeout Audit
+    echo -e "\n${YELLOW}--- GRUB Recovery Mode & Unauthenticated Boot Settings ---${NC}"
+    if [[ -f "$default_grub" ]]; then
+        local disable_rec
+        disable_rec=$(grep -v '^\s*#' "$default_grub" 2>/dev/null | grep -i 'GRUB_DISABLE_RECOVERY' | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        if [[ "$disable_rec" == "true" || "$disable_rec" == "1" ]]; then
+            log_pass "Unauthenticated GRUB recovery mode menu entries are disabled."
+        else
+            log_warn "GRUB recovery mode entries are enabled (GRUB_DISABLE_RECOVERY is not 'true'). Booting into recovery mode allows unauthenticated root access."
+        fi
+
+        local timeout_val
+        timeout_val=$(grep -v '^\s*#' "$default_grub" 2>/dev/null | grep -i 'GRUB_TIMEOUT=' | head -n 1 | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+        if [[ -n "$timeout_val" ]]; then
+            echo -e "  GRUB Menu Timeout           : ${CYAN}${timeout_val} second(s)${NC}"
+            if [[ "$timeout_val" -eq -1 || "$timeout_val" -gt 10 ]]; then
+                log_warn "GRUB_TIMEOUT is set to ${timeout_val}s (extended delay increases boot menu tampering window). Recommended: <= 5 seconds."
+            else
+                log_pass "GRUB boot menu timeout configuration verified (${timeout_val}s)."
+            fi
+        fi
+    fi
+
+    # 18.4 Kernel Boot Parameters Audit (/proc/cmdline)
+    echo -e "\n${YELLOW}--- Active Kernel Boot Parameters Audit (/proc/cmdline) ---${NC}"
+    if [[ -f "/proc/cmdline" ]]; then
+        local cmdline
+        cmdline=$(cat /proc/cmdline 2>/dev/null)
+        echo -e "  Active Kernel Cmdline: ${CYAN}${cmdline}${NC}"
+
+        local dangerous_params=("init=/bin/bash" "init=/bin/sh" "rd.break" "emerg" "emergency")
+        for dp in "${dangerous_params[@]}"; do
+            if [[ "$cmdline" =~ $dp ]]; then
+                log_crit "DANGEROUS BOOT PARAMETER ACTIVE: Kernel parameter '${dp}' is active in /proc/cmdline! Direct root shell execution on boot!"
+            fi
+        done
+
+        if [[ "$cmdline" =~ [[:space:]](single|1|s|S)[[:space:]]? ]]; then
+            log_warn "Kernel is booting in single-user maintenance mode!"
+        fi
+
+        if [[ "$cmdline" =~ selinux=0|enforcing=0|apparmor=0 ]]; then
+            log_warn "Mandatory Access Control framework disabled in kernel boot parameters!"
+        fi
+
+        if [[ "$cmdline" =~ mitigations=off|noibrs|noibpb|nopti|nospectre_v1|nospectre_v2|nospec_store_bypass_disable ]]; then
+            log_warn "CPU vulnerability mitigations disabled in kernel boot parameters!"
+        else
+            log_pass "CPU vulnerability mitigations are active in kernel parameters."
+        fi
+
+        if [[ "$cmdline" =~ audit=1 ]]; then
+            log_pass "Kernel auditing parameter 'audit=1' is enabled."
+        else
+            echo -e "  ${YELLOW}Tip: Consider adding 'audit=1' to GRUB_CMDLINE_LINUX to enable early boot kernel auditing.${NC}"
+        fi
+    fi
+
+    # 18.5 UEFI Secure Boot Audit
+    echo -e "\n${YELLOW}--- UEFI Secure Boot Status Audit ---${NC}"
+    if [[ "${TOOL_FOUND['mokutil']}" -eq 1 ]]; then
+        local sb_out
+        sb_out=$(mokutil --sb-state 2>/dev/null)
+        if [[ "$sb_out" =~ "SecureBoot enabled" ]]; then
+            log_pass "UEFI Secure Boot is ENABLED."
+        else
+            log_warn "UEFI Secure Boot is DISABLED: ${sb_out}"
+        fi
+    elif [[ -d "/sys/firmware/efi" ]]; then
+        local sb_var
+        sb_var=$(find /sys/firmware/efi/efivars/ -name "SecureBoot-*" 2>/dev/null | head -n 1)
+        if [[ -n "$sb_var" ]]; then
+            local sb_val
+            sb_val=$(od -An -t u1 "$sb_var" 2>/dev/null | awk '{print $NF}')
+            if [[ "$sb_val" == "1" ]]; then
+                log_pass "UEFI Secure Boot is ENABLED (via efivars)."
+            else
+                log_warn "UEFI Secure Boot is DISABLED (via efivars)."
+            fi
+        else
+            echo -e "  UEFI firmware detected, but SecureBoot efivar status could not be read."
+        fi
+    else
+        echo -e "  Legacy BIOS system detected (UEFI Secure Boot not applicable)."
+    fi
+}
+
+audit_grub_bootloader
+
 audit_kernel_hardening() {
     local sysctl_cmd="${TOOL_BIN['sysctl']}"
     if [[ -z "$sysctl_cmd" ]]; then
