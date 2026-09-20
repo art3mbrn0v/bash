@@ -2558,20 +2558,25 @@ audit_shell_configs_and_aliases() {
             continue
         fi
 
-        local p_perm p_owner
-        p_perm=$(stat -c "%a" "$pdir" 2>/dev/null)
-        p_owner=$(stat -c "%U" "$pdir" 2>/dev/null)
+        # Dereference symlinks using stat -L to get target directory permissions and ownership
+        local p_perm p_owner real_target
+        p_perm=$(stat -L -c "%a" "$pdir" 2>/dev/null)
+        p_owner=$(stat -L -c "%U" "$pdir" 2>/dev/null)
+        real_target=$(readlink -f "$pdir" 2>/dev/null)
 
-        if [[ "$p_perm" =~ [1-7][1-7]$ ]]; then
-            log_crit "WORLD-WRITABLE \$PATH DIRECTORY: '${pdir}' (Mode: ${p_perm}, Owner: ${p_owner})! Local users can drop malicious binaries to hijack root/user commands."
+        # World-writable check: 3rd octal digit is 2, 3, 6, or 7 (other write bit set)
+        if [[ "$p_perm" =~ [2367]$ ]]; then
+            log_crit "WORLD-WRITABLE \$PATH DIRECTORY: '${pdir}' (Target: '${real_target}', Mode: ${p_perm}, Owner: ${p_owner})! Unprivileged users can drop malicious binaries to hijack root/user commands."
             ((path_issues++))
         elif [[ "$p_owner" != "root" ]]; then
             log_warn "\$PATH directory '${pdir}' is owned by non-root user '${p_owner}' (Mode: ${p_perm})."
+        else
+            echo -e "  - \$PATH Directory ${CYAN}${pdir}${NC}: ${GREEN}Secure permissions (${p_perm}, Owner: ${p_owner})${NC}"
         fi
     done
 
     if [[ "$path_issues" -eq 0 ]]; then
-        log_pass "All directories in system \$PATH are secure and owned by root."
+        log_pass "All directories in system \$PATH are secure, non-world-writable, and owned by root."
     fi
 }
 
