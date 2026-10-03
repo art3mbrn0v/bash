@@ -1,4 +1,22 @@
+#!/usr/bin/env bash
 # ==============================================================================
+# System Security & Optimization Audit (Debian / Ubuntu / Fedora family)
+#
+# Usage: sudo ./system-audit.sh [options]
+#   (no options)         read-only audit: nothing on the system is modified
+#   --fix                apply safe permission/config remediations
+#   --install            install missing scanner packages (apt/dnf)
+#   --restart-services   restart services reported by needrestart / failed units
+#   --clean-cache        delete reclaimable user caches (thumbnails, pip, npm ...)
+#   --clean-history      remove lines with secrets from shell history (backup kept)
+#   --no-dict            do not download / refresh the weak-password dictionary
+#   --report-dir DIR     where to write the report (default: ./reports)
+#   -h, --help           show this help
+# Exit code: 0 = no critical findings, 1 = critical findings, 2 = usage error
+# ==============================================================================
+
+# Locale-independent parsing of tool output (ss, lastlog, passwd -S, ...)
+export LC_ALL=C.UTF-8
 
 # Script directory resolution
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,13 +30,33 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration & Execution Modes (Fully Automated Execution by Default)
-AUTO_FIX=true
-CLEAN_CACHE=true
+# Safe by default: the audit only READS. Every change is opt-in via a flag.
+AUTO_FIX=false
+CLEAN_CACHE=false
+CLEAN_HISTORY=false
 GENERATE_REPORT=true
-AUTO_RESTART_SERVICES=true
-INSTALL_MISSING_PKGS=true
+AUTO_RESTART_SERVICES=false
+INSTALL_MISSING_PKGS=false
 FETCH_EXTERNAL_PASSWORDS=true
 REPORT_DIR="${SCRIPT_DIR}/reports"
+TRIVY_MISSING=false
+
+usage() { sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --fix)              AUTO_FIX=true ;;
+        --install)          INSTALL_MISSING_PKGS=true ;;
+        --restart-services) AUTO_RESTART_SERVICES=true ;;
+        --clean-cache)      CLEAN_CACHE=true ;;
+        --clean-history)    CLEAN_HISTORY=true ;;
+        --no-dict)          FETCH_EXTERNAL_PASSWORDS=false ;;
+        --report-dir)       shift; REPORT_DIR="${1:?--report-dir needs a path}" ;;
+        -h|--help)          usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
 
 # Sensitive file and credential pattern definitions for security auditing
 SENSITIVE_PATTERNS=(
@@ -159,6 +197,15 @@ AUDIT_START_TIME_STR=$(date "+%Y-%m-%d %H:%M:%S %Z")
 mkdir -p "$REPORT_DIR" 2>/dev/null || true
 REPORT_FILE="$REPORT_DIR/audit-report-$(date +%Y-%m-%d_%H-%M-%S).md"
 touch "$REPORT_FILE" && chmod 600 "$REPORT_FILE" 2>/dev/null || true
+# Let the invoking user read the report without sudo
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    chown "$SUDO_USER": "$REPORT_FILE" 2>/dev/null || true
+    [[ "$(stat -c %U "$REPORT_DIR" 2>/dev/null)" == "root" ]] && chown "$SUDO_USER": "$REPORT_DIR" 2>/dev/null || true
+fi
+
+# Private scratch directory: the ONLY place this script creates temp files.
+WORK_DIR="$(mktemp -d /tmp/system-audit.XXXXXX)"
+trap 'rm -rf "$WORK_DIR"' EXIT
 exec > >(tee >(sed -r 's/\x1B\[[0-9;]*[mK]//g' > "$REPORT_FILE")) 2>&1
 
 echo -e "${CYAN}=====================================================${NC}"
@@ -189,6 +236,10 @@ log_crit() {
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
     echo -e "${RED}CRITICAL: $1${NC}"
 }
+
+# Informational lines: shown in the report but NOT counted as pass/warn/crit
+log_info() { echo -e "${CYAN}[INFO] $1${NC}"; }
+log_skip() { echo -e "${YELLOW}[SKIP] $1${NC}"; }
 
 # Safe non-blocking sudo execution wrapper
 run_sudo() {
@@ -224,6 +275,14 @@ restart_service() {
         echo -e "${YELLOW}[SKIP] Service restart skipped for '${service}' (AUTO_RESTART_SERVICES=false).${NC}"
         return 0
     fi
+
+    # Never restart units that would tear down the running desktop session / network
+    case "$service" in
+        gdm*|lightdm*|sddm*|display-manager*|systemd-logind*|dbus*|user@*|user-runtime-dir@*|getty@*|NetworkManager*|wpa_supplicant*)
+            log_skip "'${service}' not restarted automatically (would disrupt the active session) - reboot or restart it manually."
+            return 0
+            ;;
+    esac
 
     if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
         echo -n "Restarting service '${service}' (${reason})... "
@@ -346,7 +405,7 @@ TOOLS_TO_CHECK=(
     "crontab" "ip" "df" "awk" "grep" "sed" "find" "clamscan" 
     "freshclam" "chkrootkit" "trivy" "nmcli" "nmap" "docker" "podman"
     "apt-get" "dnf" "rpm" "dpkg-query" "lynis" "needrestart" "debsums"
-    "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog"
+    "python3" "pwck" "grpck" "who" "w" "last" "lastb" "lastlog" "lastlog2"
     "curl" "wget" "cryptsetup" "unhide" "lsusb" "lsblk" "lspci" "bluetoothctl" "mokutil"
 )
 
@@ -366,8 +425,11 @@ check_all_dependencies() {
             TOOL_FOUND["$tool"]=0
             printf "  [${YELLOW}!${NC}] %-15s : ${YELLOW}NOT installed${NC}\n" "$tool"
             case "$tool" in
-                clamscan|freshclam|chkrootkit|trivy|nmap|lynis|needrestart|debsums)
+                clamscan|freshclam|chkrootkit|nmap|lynis|needrestart|debsums|unhide)
                     missing_tools+=("$tool")
+                    ;;
+                trivy)
+                    TRIVY_MISSING=true
                     ;;
             esac
         fi
@@ -388,11 +450,9 @@ check_all_dependencies() {
                     chkrootkit)
                         install_pkg_and_restart_service "chkrootkit" ""
                         ;;
-                    trivy)
-                        install_pkg_and_restart_service "trivy" ""
-                        ;;
                     *)
-                        install_pkg_and_restart_service "$m_tool" "$m_tool"
+                        # CLI scanners are not daemons: nothing to restart
+                        install_pkg_and_restart_service "$m_tool" ""
                         ;;
                 esac
             done
@@ -417,8 +477,11 @@ check_all_dependencies() {
             elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
                 echo -e "  Fedora/RHEL:   ${CYAN}sudo dnf install ${missing_tools[*]}${NC}"
             fi
-            echo -e "  Tip: Set INSTALL_MISSING_PKGS=true to auto-install missing tools & start services."
+            echo -e "  Tip: run with --install to auto-install missing tools."
         fi
+    fi
+    if [[ "$TRIVY_MISSING" == true ]]; then
+        echo -e "${YELLOW}Note:${NC} trivy is not in the Debian repositories (apt cannot install it). Optional - see https://trivy.dev/latest/getting-started/installation/"
     fi
     echo ""
 }
@@ -466,8 +529,12 @@ update_security_databases() {
     fi
 
     if [[ "${TOOL_FOUND['freshclam']}" -eq 1 ]]; then
-        echo -n "Updating ClamAV virus signatures... "
-        run_sudo "${TOOL_BIN['freshclam']}" 2>/dev/null && echo -e "${GREEN}Done${NC}" || echo -e "${YELLOW}Updated or locked by daemon${NC}"
+        if systemctl is-active --quiet clamav-freshclam 2>/dev/null; then
+            echo "ClamAV signatures: kept current by the clamav-freshclam daemon - manual freshclam skipped."
+        else
+            echo -n "Updating ClamAV virus signatures... "
+            run_sudo "${TOOL_BIN['freshclam']}" --quiet 2>/dev/null && echo -e "${GREEN}Done${NC}" || echo -e "${YELLOW}Failed or locked${NC}"
+        fi
     fi
 
     if [[ "${TOOL_FOUND['trivy']}" -eq 1 ]]; then
@@ -486,7 +553,7 @@ clean_history() {
     if [[ -f "$file" ]]; then
         echo "Processing $file..."
         local temp_file
-        temp_file=$(mktemp)
+        temp_file=$(mktemp -p "$WORK_DIR")
         local pattern_regex
         pattern_regex=$(IFS="|"; echo "${SENSITIVE_PATTERNS[*]}")
         if grep -vEia "$pattern_regex" "$file" > "$temp_file" 2>/dev/null; then
@@ -505,10 +572,35 @@ clean_history() {
     fi
 }
 
-find "$HOME" -maxdepth 1 \( -name ".zsh_history" -o -name ".bash_history*" \) 2>/dev/null | while read -r h_file; do
-    clean_history "$h_file"
+HIST_FILES=()
+for h_home in "$HOME" "$(getent passwd "${SUDO_USER:-nobody}" 2>/dev/null | cut -d: -f6)"; do
+    [[ -n "$h_home" && -d "$h_home" ]] || continue
+    for h_file in "$h_home"/.zsh_history "$h_home"/.bash_history; do
+        [[ -f "$h_file" ]] && HIST_FILES+=("$h_file")
+    done
 done
-log_pass "Shell history cleaned and permissions set to 600."
+if [[ ${#HIST_FILES[@]} -gt 0 ]]; then
+    mapfile -t HIST_FILES < <(printf '%s\n' "${HIST_FILES[@]}" | sort -u)
+fi
+
+if [[ "$CLEAN_HISTORY" == true ]]; then
+    for h_file in "${HIST_FILES[@]}"; do
+        clean_history "$h_file"
+    done
+    log_pass "Shell history cleaned (backups: *.audit-backup, mode 600)."
+else
+    SENS_REGEX=$(IFS="|"; echo "${SENSITIVE_PATTERNS[*]}")
+    hist_hits=0
+    for h_file in "${HIST_FILES[@]}"; do
+        n=$(grep -ciEa "$SENS_REGEX" "$h_file" 2>/dev/null || true)
+        hist_hits=$(( hist_hits + ${n:-0} ))
+    done
+    if [[ "$hist_hits" -gt 0 ]]; then
+        log_warn "${hist_hits} shell-history line(s) contain keywords such as password/token/secret (review them; --clean-history removes them, backup is kept)."
+    else
+        log_pass "No sensitive keywords found in shell history files (${#HIST_FILES[@]} file(s) checked)."
+    fi
+fi
 
 # 2. Certificate & File Permission Checks
 section "2/24" "Checking Minikube & SSH Certificate Permissions..."
@@ -966,6 +1058,10 @@ audit_network_security_and_tunnels() {
                 if [[ "$addr_part" =~ ^127\. || "$addr_part" == "[::1]" ]]; then
                     scope="Localhost"
                     ((local_count++))
+                elif [[ "$addr_part" == *%* || "$addr_part" =~ ^\[fe80: ]] && [[ "$port" =~ ^(546|68)$ ]]; then
+                    # DHCP client bound to a link-local address: not a reachable service
+                    scope="Link-local"
+                    ((local_count++))
                 else
                     ((public_count++))
                     case "$port" in
@@ -996,10 +1092,14 @@ audit_network_security_and_tunnels() {
                 log_crit "RISKY / UNENCRYPTED PUBLIC LISTENING SERVICES DETECTED:\n${susp_msg}"
             fi
 
-            local mdns_llmnr
-            mdns_llmnr=$(echo "$ss_output" | grep -E ':5353|:5355')
-            if [[ -n "$mdns_llmnr" ]]; then
-                log_warn "Active mDNS/LLMNR services found (5353/5355). Disable systemd-resolved LLMNR/MulticastDNS if not needed."
+            if echo "$ss_output" | grep -E ':5355\b' | grep -q 'systemd-resolve'; then
+                log_warn "LLMNR (UDP/TCP 5355) is active in systemd-resolved. Disable with LLMNR=no in /etc/systemd/resolved.conf.d/ unless needed."
+            fi
+            if echo "$ss_output" | grep -E ':5353\b' | grep -q 'avahi'; then
+                log_warn "avahi-daemon (mDNS, UDP 5353) is listening. Disable avahi-daemon if you do not need network printers / Chromecast / .local discovery."
+            fi
+            if echo "$ss_output" | grep -E ':(500|4500)\b' | grep -q 'charon'; then
+                log_info "strongSwan (charon) listens on IKE ports 500/4500. Expected if you use IPsec/IKEv2; otherwise: systemctl disable --now strongswan-starter strongswan"
             fi
         else
             log_pass "No active listening TCP/UDP sockets found."
@@ -1279,12 +1379,26 @@ audit_directory_permissions() {
     echo -e "\n${CYAN}5. Critical System Binary Integrity Verification:${NC}"
     if [[ "${TOOL_FOUND['debsums']}" -eq 1 ]]; then
         echo "Running debsums integrity verification on system packages..."
-        local debsums_out
-        debsums_out=$(run_sudo "${TOOL_BIN['debsums']}" -c 2>&1 | grep -v 'OK$' | head -n 10)
-        if [[ -n "$debsums_out" ]]; then
-            log_crit "Modified system package files detected by debsums!\n$debsums_out"
+        # stdout = files whose checksum really differs; stderr = "missing file" notes.
+        # Missing files (e.g. docker-desktop's /DEBIAN/*, Papirus icons) are NOT modifications.
+        local debsums_changed debsums_missing
+        debsums_changed=$(run_sudo "${TOOL_BIN['debsums']}" -c 2>"$WORK_DIR/debsums.err")
+        debsums_missing=$(grep -c 'missing file' "$WORK_DIR/debsums.err" 2>/dev/null || true)
+        if [[ -n "$debsums_changed" ]]; then
+            local sys_changed other_changed
+            sys_changed=$(echo "$debsums_changed" | grep -E '^/(usr/)?(bin|sbin|lib|lib64|libexec)/|^/usr/lib/|^/boot/' | head -n 15)
+            other_changed=$(echo "$debsums_changed" | grep -vE '^/(usr/)?(bin|sbin|lib|lib64|libexec)/|^/usr/lib/|^/boot/' | head -n 15)
+            if [[ -n "$sys_changed" ]]; then
+                log_crit "System binaries/libraries differ from their package checksums (possible tampering):\n$sys_changed"
+            fi
+            if [[ -n "$other_changed" ]]; then
+                log_warn "Package files modified locally (not core binaries):\n$other_changed"
+            fi
         else
-            log_pass "debsums integrity verification passed: All system binaries match package checksums."
+            log_pass "debsums integrity verification passed: no package file has a different checksum."
+        fi
+        if [[ "${debsums_missing:-0}" -gt 0 ]]; then
+            log_info "debsums: ${debsums_missing} package file(s) are missing on disk (not counted as tampering; usually removed icons or packaging quirks, e.g. docker-desktop /DEBIAN/*)."
         fi
     elif [[ "${TOOL_FOUND['rpm']}" -eq 1 ]]; then
         local rpm_out
@@ -1416,7 +1530,13 @@ audit_directory_permissions() {
     # 9. World-Writable Directories & Sticky Bit (+t) Integrity Audit
     echo -e "\n${CYAN}9. World-Writable Directories & Sticky Bit (+t) Integrity Audit:${NC}"
     local ww_dirs
-    ww_dirs=$(run_sudo find /tmp /var/tmp /dev/shm /var /etc /opt /home /usr -type d -perm -0002 ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null)
+    ww_dirs=$(run_sudo find /tmp /var /etc /opt /home /usr -xdev -type d -perm -0002 ! -path "/proc*" ! -path "/sys*" ! -path "/run*" 2>/dev/null | sort -u)
+    # /dev/shm is a separate tmpfs (-xdev would skip it)
+    ww_dirs+=$'\n'$(run_sudo find /dev/shm -maxdepth 1 -type d -perm -0002 2>/dev/null)
+    local sd_private
+    sd_private=$(echo "$ww_dirs" | grep -c '/systemd-private-')
+    ww_dirs=$(echo "$ww_dirs" | grep -v '/systemd-private-' | sed '/^$/d' | sort -u)
+    [[ "$sd_private" -gt 0 ]] && echo -e "  - ${sd_private} per-service systemd PrivateTmp director(ies) (1777, sticky) collapsed"
     if [[ -n "$ww_dirs" ]]; then
         local missing_sticky=0
         while read -r wdir; do
@@ -1451,6 +1571,12 @@ fi
 if [[ "${TOOL_FOUND['lynis']}" -eq 1 ]]; then
     echo -e "\n${CYAN}Running Lynis System Audit Summary...${NC}"
     run_sudo "${TOOL_BIN['lynis']}" audit system --quick --no-colors 2>/dev/null | grep -E "Hardening index|Warnings|Suggestions"
+    if [[ -r /var/log/lynis-report.dat ]]; then
+        lynis_warn=$(grep -E '^warning\[\]=' /var/log/lynis-report.dat | cut -d= -f2- | cut -c1-150 | head -n 10)
+        lynis_sugg=$(grep -E '^suggestion\[\]=' /var/log/lynis-report.dat | cut -d= -f2- | cut -c1-150 | head -n 10)
+        [[ -n "$lynis_warn" ]] && log_warn "Lynis warnings:\n$(echo "$lynis_warn" | sed 's/^/  - /')"
+        [[ -n "$lynis_sugg" ]] && echo -e "  Top Lynis suggestions (first 10; full list: /var/log/lynis-report.dat):\n$(echo "$lynis_sugg" | sed 's/^/    - /')"
+    fi
 else
     echo -e "${YELLOW}Lynis security auditor not installed - install lynis for deep security scoring.${NC}"
 fi
@@ -1500,84 +1626,114 @@ audit_user_logins() {
         fi
     fi
 
-    # 3. Failed Login Attempts (lastb & system logs)
-    echo -e "\n${CYAN}3. Failed Login Attempts Audit (lastb & Auth Logs):${NC}"
-    local failed_logins=""
-
+    # 3. Failed Login Attempts (btmp)
+    echo -e "\n${CYAN}3. Failed Login Attempts Audit (btmp):${NC}"
     if [[ "${TOOL_FOUND['lastb']}" -eq 1 ]]; then
-        failed_logins=$(run_sudo "${TOOL_BIN['lastb']}" -n 10 2>/dev/null | grep -v '^$' | grep -v 'btmp')
-    fi
-
-    if [[ -n "$failed_logins" ]]; then
-        log_warn "Recent failed login attempts recorded in btmp:\n$failed_logins"
-        local failed_count
-        failed_count=$(echo "$failed_logins" | wc -l)
-        if [[ "$failed_count" -gt 5 ]]; then
-            log_crit "Multiple failed login attempts detected! Potential brute-force attack."
+        local failed_logins failed_n
+        failed_logins=$(run_sudo "${TOOL_BIN['lastb']}" -s -24hours 2>/dev/null | grep -vE '^$|btmp begins')
+        failed_n=$(echo -n "$failed_logins" | grep -c . || true)
+        if [[ "${failed_n:-0}" -gt 50 ]]; then
+            log_crit "${failed_n} failed logins in the last 24h recorded in btmp - potential brute-force attack."
+        elif [[ "${failed_n:-0}" -gt 0 ]]; then
+            log_warn "${failed_n} failed login(s) in the last 24h recorded in btmp:\n$(echo "$failed_logins" | head -n 10)"
+        else
+            log_pass "No failed logins in the last 24h in the btmp database."
         fi
     else
-        log_pass "No recent failed login attempts in btmp database."
+        log_skip "lastb is not installed on this system - btmp cannot be read. Failed logins are evaluated from the journal in the log scan below (not counted as a pass)."
     fi
 
-    # 4. User Login History & Inactive / Never Logged-In Interactive Users (lastlog)
-    echo -e "\n${CYAN}4. Interactive Accounts Login Activity & Inactive Users Audit (lastlog):${NC}"
-    if [[ "${TOOL_FOUND['lastlog']}" -eq 1 ]]; then
-        echo -e "Auditing login timestamps for interactive shell accounts..."
-        while IFS=: read -r username password uid gid gecos home shell; do
-            [[ "$shell" =~ (nologin|false|sync|halt|shutdown|null)$ ]] && continue
+    # 4. Last login per interactive account (lastlog / lastlog2 / last)
+    echo -e "\n${CYAN}4. Interactive Accounts Login Activity & Inactive Users Audit:${NC}"
+    echo -e "Auditing login timestamps for interactive shell accounts..."
+    while IFS=: read -r username password uid gid gecos home shell; do
+        [[ "$shell" =~ (nologin|false|sync|halt|shutdown|null)$ ]] && continue
 
-            local ll_entry
+        local ll_entry=""
+        if [[ "${TOOL_FOUND['lastlog']}" -eq 1 ]]; then
             ll_entry=$("${TOOL_BIN['lastlog']}" -u "$username" 2>/dev/null | tail -n 1)
-            if [[ "$ll_entry" =~ "**Never logged in**" ]]; then
+        elif [[ "${TOOL_FOUND['lastlog2']}" -eq 1 ]]; then
+            ll_entry=$("${TOOL_BIN['lastlog2']}" --user "$username" 2>/dev/null | tail -n 1)
+        elif [[ "${TOOL_FOUND['last']}" -eq 1 ]]; then
+            ll_entry=$("${TOOL_BIN['last']}" -n 1 "$username" 2>/dev/null | grep -vE '^$|begins' | head -n 1)
+            [[ -z "$ll_entry" ]] && ll_entry="**Never logged in**"
+        else
+            ll_entry="(no lastlog/lastlog2/last tool available)"
+        fi
+
+        if [[ "$ll_entry" == *"Never logged in"* ]]; then
+            if [[ "$uid" -ge 1000 ]]; then
                 log_warn "Interactive user '${username}' (UID ${uid}) has NEVER logged in!"
             else
-                echo -e "  - User ${CYAN}${username}${NC}: ${ll_entry}"
+                echo -e "  - System account ${CYAN}${username}${NC} (UID ${uid}): never logged in (normal)."
             fi
-        done < /etc/passwd
-    fi
+        else
+            echo -e "  - User ${CYAN}${username}${NC}: ${ll_entry}"
+        fi
+    done < /etc/passwd
 }
 
 audit_user_logins
 
 parse_security_logs() {
-    local pattern_regex="Failed password|Invalid user|authentication failure|NOT in sudoers|maximum authentication attempts|segfault|Out of memory: Kill process|denied"
+    local auth_re='authentication failure|Failed password|Invalid user|FAILED LOGIN|NOT in sudoers|maximum authentication attempts|incorrect password attempts|Failed publickey'
+    local remote_re='Failed password|Invalid user|Failed publickey|maximum authentication attempts'
+    local crash_re='segfault|Out of memory: Kill process|general protection fault|kernel BUG|Oops:'
 
     echo -e "\n${YELLOW}--- Scanning System Logs for Security Anomaly Indicators ---${NC}"
 
     if [[ "${TOOL_FOUND['journalctl']}" -eq 1 ]]; then
         echo -e "${CYAN}Scanning systemd journal (last 24h)...${NC}"
-        local journal_matches
-        journal_matches=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" -p warning..emerg --grep="$pattern_regex" --no-pager -n 15 2>/dev/null)
-        
-        if [[ -n "$journal_matches" ]]; then
-            log_warn "Suspicious entries found in systemd journal:\n$journal_matches"
+
+        # 1. Real authentication failures (PAM, sshd, su, sudo, login, display manager, screen lock)
+        local auth_lines auth_count remote_count
+        auth_lines=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" --no-pager -o cat -g "$auth_re" 2>/dev/null | sed '/^$/d')
+        auth_count=$(echo -n "$auth_lines" | grep -c . || true)
+        remote_count=$(echo -n "$auth_lines" | grep -cE "$remote_re" || true)
+        echo -e "Authentication failures (24h): ${CYAN}${auth_count:-0}${NC} (remote/ssh-style: ${CYAN}${remote_count:-0}${NC})"
+
+        if [[ "${remote_count:-0}" -gt 20 ]]; then
+            log_crit "${remote_count} remote-style authentication failures in 24h - possible brute-force attack."
+        elif [[ "${auth_count:-0}" -gt 0 ]]; then
+            echo "  Top sources:"
+            echo "$auth_lines" | sed -E 's/[0-9]+/N/g' | cut -c1-110 | sort | uniq -c | sort -rn | head -n 5 | sed 's/^/    /'
+            if [[ "${auth_count:-0}" -gt 20 ]]; then
+                log_warn "${auth_count} local authentication failures in 24h (mistyped sudo/unlock passwords or a misbehaving service). No remote-login pattern found."
+            else
+                log_pass "Only ${auth_count} local authentication failure(s) in 24h; no brute-force pattern."
+            fi
         else
-            log_pass "No high-severity security anomalies found in systemd journal (last 24h)."
+            log_pass "No authentication failures in the journal (last 24h)."
         fi
 
-        local failed_count
-        failed_count=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" --grep="failed|invalid" --no-pager 2>/dev/null | wc -l)
-        echo -e "Failed authentication events (24h): ${CYAN}${failed_count}${NC}"
-        if [[ "$failed_count" -gt 20 ]]; then
-            log_warn "High number of failed auth attempts detected (${failed_count})! Possible brute-force attack."
+        # 2. Crashes / OOM / kernel faults
+        local crash_lines
+        crash_lines=$("${TOOL_BIN['journalctl']}" --since "24 hours ago" --no-pager -o short-iso -p warning..emerg -g "$crash_re" 2>/dev/null | grep -v '^-- ' | tail -n 10)
+        if [[ -n "$crash_lines" ]]; then
+            log_warn "Crash / OOM / kernel-fault entries in the journal (last 24h):\n$crash_lines"
+        else
+            log_pass "No crash, OOM or kernel-fault entries in the journal (last 24h)."
         fi
+
+        # 3. Mandatory-access-control denials (informational)
+        local apparmor_denied
+        apparmor_denied=$("${TOOL_BIN['journalctl']}" -k --since "24 hours ago" --no-pager -o cat -g 'apparmor="DENIED"' 2>/dev/null | grep -c . || true)
+        [[ "${apparmor_denied:-0}" -gt 0 ]] && log_info "AppArmor logged ${apparmor_denied} DENIED event(s) in 24h (review with: journalctl -k -g 'apparmor=\"DENIED\"')."
     fi
 
     local target_logs=()
     [[ -f "/var/log/auth.log" ]] && target_logs+=("/var/log/auth.log")
     [[ -f "/var/log/secure" ]] && target_logs+=("/var/log/secure")
-    [[ -f "/var/log/syslog" ]] && target_logs+=("/var/log/syslog")
-    [[ -f "/var/log/messages" ]] && target_logs+=("/var/log/messages")
 
     if [[ ${#target_logs[@]} -gt 0 ]]; then
         echo -e "\n${CYAN}Scanning security log files (${target_logs[*]})...${NC}"
         for logfile in "${target_logs[@]}"; do
             local file_matches
-            file_matches=$(run_sudo grep -Ei "$pattern_regex" "$logfile" 2>/dev/null | tail -n 10)
+            file_matches=$(run_sudo grep -E "$auth_re" "$logfile" 2>/dev/null | tail -n 10)
             if [[ -n "$file_matches" ]]; then
-                log_warn "Recent suspicious entries in ${logfile}:\n$file_matches"
+                log_warn "Recent authentication failures in ${logfile}:\n$file_matches"
             else
-                log_pass "No critical security entries found in ${logfile}."
+                log_pass "No authentication failures found in ${logfile}."
             fi
         done
     fi
@@ -1671,8 +1827,7 @@ if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
             echo -e "${YELLOW}Attempting automatic recovery/restart of failed systemd services...${NC}"
             while read -r svc_line; do
                 [[ -z "$svc_line" ]] && continue
-                local f_svc
-                f_svc=$(echo "$svc_line" | awk '{print $1}')
+                f_svc=$(echo "$svc_line" | sed -E 's/^[^A-Za-z0-9]+//' | awk '{print $1}')
                 if [[ -n "$f_svc" ]]; then
                     restart_service "$f_svc" "recovering failed unit"
                 fi
@@ -1762,7 +1917,7 @@ audit_and_clean_user_cache() {
         done
 
         local core_files
-        core_files=$(find "$home" -maxdepth 2 -name "core*" -type f 2>/dev/null)
+        core_files=$(find "$home" -maxdepth 2 -type f \( -name "core" -o -regex '.*/core\.[0-9]+' \) 2>/dev/null)
         if [[ -n "$core_files" ]]; then
             while read -r cfile; do
                 [[ -f "$cfile" ]] || continue
@@ -1827,6 +1982,7 @@ audit_user_privileges_groups_and_login_counts() {
     echo -e "${CYAN}Per-User Account Details (UID, Primary/Secondary Groups, Privileges, Login Count):${NC}"
 
     while IFS=: read -r username password uid gid gecos home shell; do
+        [[ "$uid" -eq 65534 ]] && continue   # 'nobody'
         # Filter for interactive users (UID >= 1000 or UID 0 / root or accounts with login shells)
         if [[ "$uid" -ge 1000 || "$uid" -eq 0 || "$shell" =~ (bash|zsh|sh|csh|tcsh|ksh)$ ]]; then
             ((interactive_users++))
@@ -1849,15 +2005,15 @@ audit_user_privileges_groups_and_login_counts() {
                 is_privileged=true
                 priv_details="[UID 0 ROOT]"
             fi
-            if [[ "$user_groups" =~ \b(sudo|wheel|admin)\b ]]; then
+            if [[ ",${user_groups}," =~ ,(sudo|wheel|admin), ]]; then
                 is_privileged=true
                 priv_details+=" [SUDOERS ACCESS]"
             fi
-            if [[ "$user_groups" =~ \b(docker|containerd|podman)\b ]]; then
+            if [[ ",${user_groups}," =~ ,(docker|containerd|podman), ]]; then
                 is_privileged=true
                 priv_details+=" [DOCKER/CONTAINER HOST ACCESS]"
             fi
-            if [[ "$user_groups" =~ \b(shadow|disk|kmem)\b ]]; then
+            if [[ ",${user_groups}," =~ ,(shadow|disk|kmem), ]]; then
                 is_privileged=true
                 priv_details+=" [RAW DISK/SHADOW ACCESS]"
             fi
@@ -1877,8 +2033,10 @@ audit_user_privileges_groups_and_login_counts() {
         fi
     done < /etc/passwd
 
-    if [[ "$privileged_users_count" -gt 0 ]]; then
-        log_warn "Discovered ${privileged_users_count} privileged/administrative account(s) out of ${interactive_users} total user account(s)."
+    if [[ "$privileged_users_count" -gt 2 ]]; then
+        log_warn "Discovered ${privileged_users_count} privileged/administrative accounts (root included) out of ${interactive_users} user account(s). Review who really needs sudo/docker."
+    elif [[ "$privileged_users_count" -gt 0 ]]; then
+        log_pass "Privileged accounts: ${privileged_users_count} of ${interactive_users} (root + the expected admin user(s))."
     else
         log_pass "User privileges audit completed: ${interactive_users} interactive user account(s) evaluated."
     fi
@@ -2129,23 +2287,40 @@ audit_passwd_group_shadow() {
             local py_result
             py_result=$(run_sudo timeout 600s "$py_cmd" - "$sys_hostname" "$dict_arg" << 'PYEOF' 2>/dev/null
 import sys, ctypes, ctypes.util, os, time
-try:
-    import urllib.request
-except ImportError:
-    urllib = None
+import multiprocessing as mp
 
 hostname = sys.argv[1] if len(sys.argv) > 1 else ""
 dict_file = sys.argv[2] if len(sys.argv) > 2 else ""
+BUDGET_SEC = 240          # per-account time budget
 
 libname = ctypes.util.find_library('crypt')
-lib = None
-if libname:
-    try:
-        lib = ctypes.CDLL(libname)
-        lib.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        lib.crypt.restype = ctypes.c_char_p
-    except Exception:
-        lib = None
+_lib = None
+
+def _load():
+    global _lib
+    if _lib is None and libname:
+        try:
+            l = ctypes.CDLL(libname)
+            l.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+            l.crypt.restype = ctypes.c_char_p
+            _lib = l
+        except Exception:
+            _lib = None
+    return _lib
+
+def _worker(task):
+    h, pws = task
+    l = _load()
+    if not l:
+        return (None, 0)
+    hb = h.encode()
+    n = 0
+    for p in pws:
+        n += 1
+        r = l.crypt(p.encode('utf-8', 'ignore'), hb)
+        if r and r.decode('utf-8', 'ignore') == h:
+            return (p, n)
+    return (None, n)
 
 common_passwords = [
     '123456', 'password', 'qwerty', 'admin', '12345678', 'root',
@@ -2170,41 +2345,59 @@ if dict_file and os.path.exists(dict_file):
     except Exception as err:
         print(f"FETCH_ERR:combined-dict.txt:{err}:0s")
 
+print("CRYPT_AVAILABLE:" + ("1" if _load() else "0"))
+
 weak_found = []
+partial = []
 algo_counts = {}
+base = list(dict.fromkeys(common_passwords))
+workers = max(1, (os.cpu_count() or 2))
 
 if os.path.exists('/etc/shadow'):
     with open('/etc/shadow', 'r') as f:
         for line in f:
             parts = line.strip().split(':')
-            if len(parts) >= 2:
-                user = parts[0]
-                hash_val = parts[1]
-                if hash_val and not hash_val.startswith(('!', '*', '!!', 'x')):
-                    algo = "Unknown"
-                    if hash_val.startswith('$y$'): algo = "Yescrypt"
-                    elif hash_val.startswith('$6$'): algo = "SHA-512"
-                    elif hash_val.startswith('$5$'): algo = "SHA-256"
-                    elif hash_val.startswith('$1$'): algo = "MD5 (Obsolete)"
-                    elif hash_val.startswith('$2a$') or hash_val.startswith('$2b$'): algo = "Bcrypt"
-                    elif len(hash_val) == 13: algo = "DES (Obsolete)"
-                    
-                    algo_counts[algo] = algo_counts.get(algo, 0) + 1
+            if len(parts) < 2:
+                continue
+            user, hash_val = parts[0], parts[1]
+            if not hash_val or hash_val.startswith(('!', '*', 'x')):
+                continue
+            algo = "Unknown"
+            if hash_val.startswith('$y$'): algo = "Yescrypt"
+            elif hash_val.startswith('$6$'): algo = "SHA-512"
+            elif hash_val.startswith('$5$'): algo = "SHA-256"
+            elif hash_val.startswith('$1$'): algo = "MD5 (Obsolete)"
+            elif hash_val.startswith('$2a$') or hash_val.startswith('$2b$'): algo = "Bcrypt"
+            elif len(hash_val) == 13: algo = "DES (Obsolete)"
+            algo_counts[algo] = algo_counts.get(algo, 0) + 1
 
-                    if lib:
-                        user_dict = list(set(common_passwords + [
-                            user, f'{user}123', f'{user}2026', f'{user}!', f'{user}1', f'{user}2025'
-                        ]))
-                        for p in user_dict:
-                            res = lib.crypt(p.encode('utf-8'), hash_val.encode('utf-8'))
-                            if res and res.decode('utf-8') == hash_val:
-                                weak_found.append((user, p))
-                                break
+            if not _load():
+                continue
+            cand = list(dict.fromkeys(base + [user, f'{user}123', f'{user}2025', f'{user}2026', f'{user}!', f'{user}1']))
+            chunk = 64
+            tasks = [(hash_val, cand[i:i + chunk]) for i in range(0, len(cand), chunk)]
+            tested = 0
+            hit = None
+            t0 = time.time()
+            with mp.Pool(workers) as pool:
+                for pw, n in pool.imap_unordered(_worker, tasks):
+                    tested += n
+                    if pw is not None:
+                        hit = pw
+                        break
+                    if time.time() - t0 > BUDGET_SEC:
+                        break
+            if hit is not None:
+                weak_found.append((user, hit))
+            elif tested < len(cand):
+                partial.append((user, tested, len(cand)))
 
 print("TOTAL_PASSWORDS:" + str(len(set(common_passwords))))
-print("ALGOS:" + ",".join([f"{k}:{v}" for k,v in algo_counts.items()]))
+print("ALGOS:" + ",".join([f"{k}:{v}" for k, v in algo_counts.items()]))
 for u, p in weak_found:
     print(f"WEAK:{u}:{p}")
+for u, a, b in partial:
+    print(f"PARTIAL:{u}:{a}:{b}")
 PYEOF
             )
 
@@ -2253,7 +2446,13 @@ PYEOF
                         log_crit "WEAK PASSWORD DETECTED for user '${user}': password matches a common dictionary pattern. Change it immediately."
                     done <<< "$weak_entries"
                 else
-                    log_pass "Password strength dictionary scan completed: No common weak passwords found for active user accounts."
+                    if grep -q '^CRYPT_AVAILABLE:0' <<< "$py_result"; then
+                        log_warn "Weak-password check could NOT run: libcrypt is not loadable from python3 (result is unknown, not 'clean')."
+                    elif grep -q '^PARTIAL:' <<< "$py_result"; then
+                        log_warn "Weak-password dictionary check hit its time budget (partial coverage): $(grep '^PARTIAL:' <<< "$py_result" | tr '\n' ' ')"
+                    else
+                        log_pass "Password strength dictionary scan completed: No common weak passwords found for active user accounts."
+                    fi
                 fi
             fi
         else
@@ -2279,19 +2478,21 @@ PYEOF
             echo -e "    - ENCRYPT_METHOD: ${CYAN}${def_enc:-YESCRYPT}${NC}"
 
             if [[ -n "$def_max" && "$def_max" -ge 99999 ]]; then
-                log_warn "PASS_MAX_DAYS in /etc/login.defs is set to 99999 (Default password expiration is disabled). Recommended: <= 90 or <= 180 days."
+                log_info "PASS_MAX_DAYS=99999 (no forced password rotation). This matches NIST SP 800-63B (no periodic rotation); set limits only if your policy demands it."
             else
                 log_pass "System PASS_MAX_DAYS policy verified (${def_max} days)."
             fi
 
             if [[ -n "$def_min" && "$def_min" -eq 0 ]]; then
-                log_warn "PASS_MIN_DAYS in /etc/login.defs is 0 (Users can change password multiple times in the same day). Recommended: >= 1 day."
+                log_info "PASS_MIN_DAYS=0 (password may be changed repeatedly). Only relevant if you enforce password history/rotation."
             fi
 
-            if [[ "$def_umask" =~ ^(022|002)$ ]]; then
-                log_warn "Default system UMASK in /etc/login.defs is ${def_umask} (Group/world readable default files). Recommended: 027 or 077."
+            local eff_umask="${def_umask:-022}"
+            [[ -z "$def_umask" ]] && log_info "UMASK is not set in /etc/login.defs; the default 022 applies."
+            if [[ "$eff_umask" =~ ^0?(022|002|000)$ ]]; then
+                log_warn "Effective default UMASK is ${eff_umask} (new files readable by group/others). Recommended: 027 or 077."
             else
-                log_pass "Default system UMASK policy verified (${def_umask:-027})."
+                log_pass "Default system UMASK policy verified (${eff_umask})."
             fi
 
             if [[ "$def_enc" =~ DES|MD5 ]]; then
@@ -2663,10 +2864,13 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     fi
 
     echo -e "\n${YELLOW}--- Checking Recommended Security Packages ---${NC}"
-    RECOMMENDED_PKGS=("fail2ban" "ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "chkrootkit" "trivy" "needrestart" "debsums" "lynis")
+    RECOMMENDED_PKGS=("ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "chkrootkit" "needrestart" "debsums" "lynis")
+    # fail2ban only makes sense when an SSH daemon is installed
+    [[ -f /etc/ssh/sshd_config ]] && RECOMMENDED_PKGS+=("fail2ban")
+    UPGRADABLE_LIST=$(apt list --upgradable 2>/dev/null)
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
-            PKG_UPDATE=$(apt list --upgradable 2>/dev/null | grep -E "^${pkg}/")
+            PKG_UPDATE=$(grep -E "^${pkg}/" <<< "$UPGRADABLE_LIST")
             if [[ -n "$PKG_UPDATE" ]]; then
                 echo -e "  - $pkg: ${GREEN}Installed${NC} | ${RED}Update Available in Repo${NC}"
             else
@@ -2679,7 +2883,6 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
 
     if [[ "${TOOL_FOUND['needrestart']}" -eq 1 ]]; then
         echo -e "\n${CYAN}Needrestart Check (Services needing restart after package updates):${NC}"
-        local svcs_needing_restart
         svcs_needing_restart=$(run_sudo "${TOOL_BIN['needrestart']}" -b 2>/dev/null | grep 'NEEDRESTART-SVC:' | awk '{print $2}')
         if [[ -n "$svcs_needing_restart" ]]; then
             log_warn "Background services require restart due to updated binaries/libraries:\n$svcs_needing_restart"
@@ -2783,6 +2986,46 @@ audit_pinned_packages
 # 12. Suspicious Process & Threat Detection Audit
 section "12/24" "Auditing Running Processes for Suspicious Activity & Malware Indicators..."
 
+# ------------------------------------------------------------------------------
+# Hidden-process detection (PIDs in /proc that ps does not list).
+# Race-safe: a PID must still exist, still be missing from a FRESH ps snapshot taken a
+# second later, and must not be a descendant of this script (its own ps/awk/sort helpers
+# are short-lived and were the cause of false "hidden process" alarms).
+# ------------------------------------------------------------------------------
+HIDDEN_PIDS_RESULT=""
+HIDDEN_PIDS_DONE=false
+
+is_own_descendant() {
+    local p="$1" pp i
+    for i in {1..40}; do
+        [[ "$p" == "$$" ]] && return 0
+        pp=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null)
+        [[ -z "$pp" || "$pp" -le 1 ]] && return 1
+        p="$pp"
+    done
+    return 1
+}
+
+detect_hidden_pids() {
+    [[ "$HIDDEN_PIDS_DONE" == true ]] && return 0
+    HIDDEN_PIDS_DONE=true
+    local proc_pids ps_pids candidates pid pname puser
+    proc_pids=$(find /proc -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null | sort)
+    ps_pids=$(ps -e -o pid= 2>/dev/null | tr -d ' ' | sort)
+    candidates=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids"))
+    [[ -z "$candidates" ]] && return 0
+    sleep 1
+    ps_pids=$(ps -e -o pid= 2>/dev/null | tr -d ' ' | sort)
+    for pid in $candidates; do
+        [[ -d "/proc/$pid" ]] || continue                 # short-lived process, already gone
+        grep -qx "$pid" <<< "$ps_pids" && continue         # visible to ps now
+        is_own_descendant "$pid" && continue               # helper spawned by this script
+        pname=$(cat "/proc/$pid/comm" 2>/dev/null)
+        puser=$(stat -c %U "/proc/$pid" 2>/dev/null)
+        HIDDEN_PIDS_RESULT+="PID ${pid} (comm: ${pname:-?}, user: ${puser:-?})\\n"
+    done
+}
+
 audit_suspicious_processes() {
     local threats_found=0
 
@@ -2803,7 +3046,11 @@ audit_suspicious_processes() {
         fi
     done
     if [[ -n "$deleted_procs" ]]; then
-        log_crit "Processes executing deleted binary files detected!\n$deleted_procs"
+        if grep -qvE -- '-> /(usr|opt|lib|lib64|bin|sbin)/' <<< "$(echo -e "$deleted_procs")"; then
+            log_crit "Processes executing deleted binary files outside package-managed paths (typical malware pattern)!\n$deleted_procs"
+        else
+            log_warn "Processes still run binaries replaced by a package update (stale until restarted; see needrestart / reboot):\n$deleted_procs"
+        fi
     else
         log_pass "No processes running deleted binaries found."
     fi
@@ -2867,34 +3114,12 @@ audit_suspicious_processes() {
         fi
     fi
 
-    # 2. /proc PID directory vs 'ps' process table comparison
-    local proc_pids ps_pids
-    proc_pids=$(find /proc -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | awk -F/ '{print $2}' | sort -n)
-    ps_pids=$(ps -eo pid= 2>/dev/null | tr -d ' ' | sort -n)
-
-    if [[ -n "$proc_pids" && -n "$ps_pids" ]]; then
-        local hidden_pids
-        hidden_pids=$(comm -23 <(echo "$proc_pids") <(echo "$ps_pids"))
-
-        if [[ -n "$hidden_pids" ]]; then
-            while read -r hpid; do
-                [[ -z "$hpid" ]] && continue
-                # Verify PID is still active in /proc to filter transient processes
-                if [[ -d "/proc/$hpid" ]]; then
-                    local hname huser hcmd
-                    hname=$(run_sudo cat "/proc/$hpid/comm" 2>/dev/null || echo "Unknown")
-                    hcmd=$(run_sudo cat "/proc/$hpid/cmdline" 2>/dev/null | tr '\0' ' ' || echo "N/A")
-                    huser=$(run_sudo stat -c "%U" "/proc/$hpid" 2>/dev/null || echo "Unknown")
-                    hidden_procs_list+="PID ${hpid} (User: ${huser}, Name: ${hname}) [Cmd: ${hcmd}]\n"
-                    ((hidden_found++))
-                    ((threats_found++))
-                fi
-            done <<< "$hidden_pids"
-        fi
-    fi
-
-    if [[ -n "$hidden_procs_list" ]]; then
-        log_crit "HIDDEN PROCESSES DETECTED (Present in /proc but hidden from 'ps'):\n$hidden_procs_list"
+    # 2. /proc PID directory vs 'ps' process table comparison (race-safe, see detect_hidden_pids)
+    detect_hidden_pids
+    if [[ -n "$HIDDEN_PIDS_RESULT" ]]; then
+        log_crit "HIDDEN PROCESSES DETECTED (present in /proc, absent from 'ps', still alive after re-check):\n$HIDDEN_PIDS_RESULT"
+        ((hidden_found++))
+        ((threats_found++))
     fi
 
     # 3. Deep Hidden Process Scan using 'unhide' tool if installed
@@ -2934,49 +3159,31 @@ audit_suspicious_processes() {
             pcomm=$(ps -p "$zppid" -o comm= 2>/dev/null || echo "Unknown")
             log_warn "ZOMBIE PROCESS: PID ${zpid} (Name: '${zcomm}', User: ${zuser}) | Parent PPID ${zppid} (Name: '${pcomm}')"
 
-            if [[ "$AUTO_FIX" == true ]]; then
-                echo -n "  Attempting cleanup of Zombie PID ${zpid} (Notifying Parent PPID ${zppid})... "
-                # Step A: Send SIGCHLD to parent process to harvest zombie
-                run_sudo kill -SIGCHLD "$zppid" 2>/dev/null
-                sleep 0.2
-                if ! ps -p "$zpid" &>/dev/null; then
-                    log_pass "Zombie PID ${zpid} successfully harvested by parent process."
-                else
-                    # Step B: If parent is not init/systemd, terminate parent process so PID 1 inherits and reaps the zombie
-                    if [[ "$zppid" -gt 1 && "$pcomm" != "systemd" && "$pcomm" != "init" ]]; then
-                        echo -n "  Parent did not harvest. Terminating parent process PPID ${zppid} (${pcomm})... "
-                        run_sudo kill -15 "$zppid" 2>/dev/null || run_sudo kill -9 "$zppid" 2>/dev/null
-                        sleep 0.2
-                        if ! ps -p "$zpid" &>/dev/null; then
-                            log_pass "Zombie PID ${zpid} reaped after parent process termination."
-                        else
-                            log_warn "Could not clean Zombie PID ${zpid} (Parent PPID ${zppid} active)."
-                        fi
-                    else
-                        log_warn "Cannot kill Parent PPID ${zppid} (System daemon/Init)."
-                    fi
-                fi
-            fi
+            echo "  Note: a zombie is already dead; only its parent (PPID ${zppid}, '${pcomm}') can reap it. Restart that parent if the zombie persists. (This script never kills processes.)"
         done <<< "$zombie_procs"
     else
         log_pass "No Zombie (defunct) processes detected."
     fi
 
-    # 2. Orphan Processes Check
-    echo -e "\n${CYAN}Auditing Active Orphan Processes (Re-parented to PID 1):${NC}"
-    local orphan_procs=""
-    while read -r opid ouser ostat oargs; do
+    # 2. Orphan processes: re-parented to PID 1, owned by a normal user, running a binary
+    #    OUTSIDE package-managed locations (desktop daemons under /usr or /opt are normal).
+    echo -e "\n${CYAN}Auditing Orphan Processes (PPID=1, non-root) running from non-system locations:${NC}"
+    local orphan_procs="" opid ouser oexe
+    while read -r opid ouser; do
         [[ -z "$opid" ]] && continue
-        if [[ "$oargs" != *systemd* && "$oargs" != *dbus* && "$oargs" != *sshd* && "$oargs" != *NetworkManager* && "$oargs" != *journald* ]]; then
-            orphan_procs+="PID ${opid} (User: ${ouser}, Stat: ${ostat}) [Cmd: ${oargs}]\n"
-            ((orphan_count++))
-        fi
-    done < <(ps -eo pid,user,stat,args 2>/dev/null | awk '$1 != 1 && $2 != "root" && $3 !~ /^Z/ {print $1, $2, $3, $4}')
+        oexe=$(readlink "/proc/$opid/exe" 2>/dev/null)
+        [[ -z "$oexe" ]] && continue
+        case "$oexe" in
+            /usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/opt/*|/snap/*|/nix/store/*) continue ;;
+        esac
+        orphan_procs+="PID ${opid} (User: ${ouser}) -> ${oexe}\n"
+        ((orphan_count++))
+    done < <(ps -eo pid=,ppid=,user= 2>/dev/null | awk '$2 == 1 && $1 != 1 && $3 != "root" {print $1, $3}')
 
     if [[ -n "$orphan_procs" ]]; then
-        log_warn "Discovered non-system Orphan processes (PPID=1):\n$orphan_procs"
+        log_warn "Orphan processes (PPID=1) running binaries from non-system locations:\n$orphan_procs"
     else
-        log_pass "No non-system orphan processes detected."
+        log_pass "No suspicious orphan processes (PPID=1 outside package-managed paths)."
     fi
 
     echo -e "\n${YELLOW}--- 7. Top CPU & RAM Consuming Processes ---${NC}"
@@ -3020,13 +3227,13 @@ audit_shell_configs_and_aliases() {
 
         for rc_path in "${user_rc_found[@]}"; do
             local found_suspicious
-            found_suspicious=$(grep -Ei "$hijacking_patterns" "$rc_path" 2>/dev/null | grep -vE "alias ls='ls --color|alias ll=|alias la=")
+            found_suspicious=$(grep -Ei "$hijacking_patterns" "$rc_path" 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -vE "alias ls='ls --color|alias ll=|alias la=")
             if [[ -n "$found_suspicious" ]]; then
                 suspicious_findings+="Suspicious alias in ${rc_path}:\n$found_suspicious\n"
             fi
 
             local found_exec
-            found_exec=$(grep -Ei "$dangerous_exec_patterns" "$rc_path" 2>/dev/null)
+            found_exec=$(grep -Ei "$dangerous_exec_patterns" "$rc_path" 2>/dev/null | grep -vE '^[[:space:]]*#')
             if [[ -n "$found_exec" ]]; then
                 suspicious_findings+="Dangerous execution pattern in ${rc_path}:\n$found_exec\n"
             fi
@@ -3118,9 +3325,32 @@ section "14/24" "Auditing SUID / SGID Executables & Privilege Escalation Risks..
 audit_suid_files() {
     echo -e "${YELLOW}--- 14.1 SUID/SGID Binaries in Volatile & Non-Standard Paths ---${NC}"
     local suspicious_suid
-    suspicious_suid=$(run_sudo find /tmp /var/tmp /dev/shm /home /opt /var/www /srv -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
+    suspicious_suid=$(run_sudo find /tmp /var/tmp /dev/shm /home /opt /var/www /srv -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
     if [[ -n "$suspicious_suid" ]]; then
-        log_crit "SUID/SGID executable files found in volatile / user / web paths:\n$(echo "$suspicious_suid" | sed 's/^/  - /')"
+        local unowned_suid="" pkg_suid="" sfile owner_pkg
+        while read -r sfile; do
+            [[ -z "$sfile" ]] && continue
+            owner_pkg=""
+            if command -v dpkg &>/dev/null; then
+                owner_pkg=$(dpkg -S "$sfile" 2>/dev/null | head -n 1 | cut -d: -f1)
+            elif command -v rpm &>/dev/null; then
+                owner_pkg=$(rpm -qf "$sfile" 2>/dev/null | head -n 1)
+            fi
+            if [[ -n "$owner_pkg" ]]; then
+                pkg_suid+="  - ${sfile}  (shipped by package: ${owner_pkg})\n"
+            else
+                unowned_suid+="  - ${sfile}\n"
+            fi
+        done <<< "$suspicious_suid"
+
+        if [[ -n "$pkg_suid" ]]; then
+            log_info "SUID/SGID helpers installed by packages outside /usr (expected, e.g. the Chrome/Electron sandbox):\n$pkg_suid"
+        fi
+        if [[ -n "$unowned_suid" ]]; then
+            log_crit "SUID/SGID files NOT owned by any package in volatile / user / web paths:\n$unowned_suid"
+        else
+            log_pass "No unowned SUID/SGID files in volatile or user paths (package-owned helpers listed above are expected)."
+        fi
     else
         log_pass "No SUID/SGID files found in volatile or user paths (/tmp, /dev/shm, /home, /opt, /var/www)."
     fi
@@ -3439,16 +3669,17 @@ audit_grub_bootloader() {
         cmdline=$(cat /proc/cmdline 2>/dev/null)
         echo -e "  Active Kernel Cmdline: ${CYAN}${cmdline}${NC}"
 
-        local dangerous_params=("init=/bin/bash" "init=/bin/sh" "rd.break" "emerg" "emergency")
-        for dp in "${dangerous_params[@]}"; do
-            if [[ "$cmdline" =~ $dp ]]; then
-                log_crit "DANGEROUS BOOT PARAMETER ACTIVE: Kernel parameter '${dp}' is active in /proc/cmdline! Direct root shell execution on boot!"
-            fi
+        local -a cmd_tokens
+        read -ra cmd_tokens <<< "$cmdline"
+        local tok
+        for tok in "${cmd_tokens[@]}"; do
+            case "$tok" in
+                init=/bin/bash|init=/bin/sh|rd.break|rd.break=*|emergency|systemd.unit=emergency.target)
+                    log_crit "DANGEROUS BOOT PARAMETER ACTIVE: '${tok}' in /proc/cmdline (root shell on boot)!" ;;
+                single|s|S|1|systemd.unit=rescue.target)
+                    log_warn "Kernel booted in single-user / rescue mode (parameter '${tok}')." ;;
+            esac
         done
-
-        if [[ "$cmdline" =~ [[:space:]](single|1|s|S)[[:space:]]? ]]; then
-            log_warn "Kernel is booting in single-user maintenance mode!"
-        fi
 
         if [[ "$cmdline" =~ selinux=0|enforcing=0|apparmor=0 ]]; then
             log_warn "Mandatory Access Control framework disabled in kernel boot parameters!"
@@ -3690,13 +3921,16 @@ audit_dns_hosts() {
         rctl_status=$(resolvectl status 2>/dev/null)
         if [[ -n "$rctl_status" ]]; then
             local doh_line dnssec_line
-            doh_line=$(echo "$rctl_status" | grep -i "DNSOverTLS" | head -n 1)
-            dnssec_line=$(echo "$rctl_status" | grep -i "DNSSEC" | head -n 1)
+            local proto_line
+            proto_line=$(echo "$rctl_status" | awk '/^Global/{g=1;next} /^Link /{g=0} g && /Protocols:/{print; exit}')
+            [[ -z "$proto_line" ]] && proto_line=$(echo "$rctl_status" | grep -m1 'Protocols:')
+            doh_line=$(grep -oE '[+-]DNSOverTLS' <<< "$proto_line" | head -n 1)
+            dnssec_line=$(grep -oE 'DNSSEC=[^ ]+' <<< "$proto_line" | head -n 1)
 
             echo -e "  systemd-resolved DoT Status : ${CYAN}${doh_line:-Not reported}${NC}"
             echo -e "  systemd-resolved DNSSEC     : ${CYAN}${dnssec_line:-Not reported}${NC}"
 
-            if [[ "$doh_line" =~ yes|opportunistic ]]; then
+            if [[ "$doh_line" == "+DNSOverTLS" ]]; then
                 log_pass "DNS-over-TLS (DoT) is active in systemd-resolved."
             else
                 log_warn "DNS-over-TLS (DoT) is NOT enabled in systemd-resolved (DNS queries are transmitted in plain text)."
@@ -3788,17 +4022,31 @@ audit_connected_devices() {
             echo "$block_devs" | sed 's/^/  /'
 
             local removable_mounts
-            removable_mounts=$(lsblk -rn -o NAME,TRAN,RM,MOUNTPOINT 2>/dev/null | awk '$3 == "1" || $2 == "usb" {if ($4 != "") print $1, $4}')
+            removable_mounts=""
+            local _dev _mp _rm _tr
+            while read -r _dev; do
+                [[ -z "$_dev" ]] && continue
+                _mp=$(findmnt -rn -o TARGET "/dev/$_dev" 2>/dev/null | head -n 1)
+                [[ -z "$_mp" ]] && continue
+                _rm=$(lsblk -ndo RM "/dev/$_dev" 2>/dev/null | tr -d ' ')
+                _tr=$(lsblk -ndo TRAN "/dev/$_dev" 2>/dev/null | tr -d ' ')
+                if [[ "$_rm" == "1" || "$_tr" =~ ^(usb|mmc)$ || "$_dev" == mmcblk* ]]; then
+                    removable_mounts+="${_dev} ${_mp}"$'\n'
+                fi
+            done < <(lsblk -rno NAME 2>/dev/null)
+            removable_mounts=${removable_mounts%$'\n'}
             if [[ -n "$removable_mounts" ]]; then
-                log_warn "Mounted removable storage media detected:\n$removable_mounts"
+                log_info "Mounted removable storage media (USB / SD card):\n$removable_mounts"
                 
                 # Check mount security options (noexec, nosuid, nodev)
                 while read -r dev mpoint; do
                     [[ -z "$mpoint" ]] && continue
                     local mopts
                     mopts=$(findmnt -n -o OPTIONS "$mpoint" 2>/dev/null)
-                    if [[ "$mopts" != *noexec* || "$mopts" != *nosuid* ]]; then
-                        log_warn "Removable media mounted at '${mpoint}' lacks 'noexec' or 'nosuid' mount flags! (Current options: ${mopts:-default})"
+                    if [[ "$mopts" != *nosuid* ]]; then
+                        log_warn "Removable media mounted at '${mpoint}' lacks the 'nosuid' flag (options: ${mopts:-default})."
+                    elif [[ "$mopts" != *noexec* ]]; then
+                        log_info "Removable media at '${mpoint}' is mounted nosuid but without 'noexec' (normal for data cards; add noexec if you never run programs from it)."
                     else
                         log_pass "Removable media mounted at '${mpoint}' has secure mount options (${mopts})."
                     fi
@@ -4085,13 +4333,19 @@ audit_logging_services() {
     echo -e "\n${YELLOW}--- Suspicious Scheduled Task Detection (cron / systemd / at) ---${NC}"
     local suspicious_tasks=0
 
-    local cron_blacklist="/dev/shm|/tmp/|/var/tmp/|curl.*\||wget.*\||python.*-c|base64.*-d|nohup|/dev/tcp|chmod 777|eval"
+    # Strict patterns only (download-and-execute, reverse shells, encoded payloads, staging dirs).
+    # Plain `eval`, `nohup` or /tmp usage is common in legitimate package cron scripts.
+    local cron_blacklist='(curl|wget)[^|#]*\|[[:space:]]*(ba|z)?sh|/dev/tcp/|base64[[:space:]]+(-d|--decode)|(^|[[:space:]=])/(dev/shm|var/tmp)/|python[0-9.]*[[:space:]]+-c|nc[[:space:]]+-e|chmod[[:space:]]+[0-7]*777'
     while read -r cfile; do
         [[ -f "$cfile" ]] || continue
         local hits
         hits=$(grep -E "$cron_blacklist" "$cfile" 2>/dev/null | grep -v '^\s*#' | head -n 5)
         if [[ -n "$hits" ]]; then
-            log_crit "SUSPICIOUS CRON TASK in ${cfile} (download/decode/obfuscation patterns):\n$hits"
+            if command -v dpkg &>/dev/null && dpkg -S "$cfile" &>/dev/null; then
+                log_warn "Package-owned cron file ${cfile} matches a suspicious pattern (verify with: debsums -c):\n$hits"
+            else
+                log_crit "SUSPICIOUS CRON TASK in ${cfile} (download/decode/obfuscation patterns):\n$hits"
+            fi
             suspicious_tasks=$((suspicious_tasks + 1))
         fi
     done < <(find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly -type f 2>/dev/null; [[ -f /etc/crontab ]] && echo /etc/crontab)
@@ -4248,19 +4502,14 @@ audit_behavioral_rootkit_indicators() {
 
     # 1. Hidden processes: a userland rootkit hides entries from ps but not from /proc.
     echo -e "\n${CYAN}1. Hidden Process Detection (/proc enumeration vs ps):${NC}"
-    local ps_pids proc_pids hidden_pids=""
-    ps_pids=$(ps -e -o pid= 2>/dev/null | awk '{print $1}' | sort -n | tr '\n' ' ')
-    proc_pids=$(ls -d /proc/[0-9]* 2>/dev/null | awk -F/ '{print $3}' | sort -n)
-    for pid in $proc_pids; do
-        if [[ " $ps_pids " != *" $pid "* ]]; then
-            hidden_pids+="$pid "
-        fi
-    done
+    detect_hidden_pids
+    local hidden_pids="$HIDDEN_PIDS_RESULT"
     if [[ -n "$hidden_pids" ]]; then
-        log_crit "HIDDEN PROCESSES DETECTED: PIDs visible in /proc but hidden from 'ps': ${hidden_pids}(possible userland rootkit / LD_PRELOAD hook)."
+        # Already counted as CRITICAL in section 12 (same cached, race-checked result): do not double count.
+        echo -e "${RED}Hidden processes confirmed (counted once, in section 12):${NC}\n${hidden_pids}"
         indicators=$((indicators + 1))
     else
-        log_pass "No hidden processes: all /proc PIDs are visible to ps."
+        log_pass "No hidden processes: every /proc PID is visible to ps (re-checked after 1s, own helpers excluded)."
     fi
 
     # 2. Shared library preload hooks (classic userland rootkit mechanism)
@@ -4310,22 +4559,24 @@ audit_behavioral_rootkit_indicators() {
     # 6. Kernel module anomalies: modules present in /sys/module but hidden from lsmod
     echo -e "\n${CYAN}6. Kernel Module Anomalies (lsmod vs /sys/module):${NC}"
     if command -v lsmod &>/dev/null; then
-        local lsmod_mods sys_mods hidden_mods
-        lsmod_mods=$(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | sort)
-        sys_mods=$(ls /sys/module 2>/dev/null | sort)
+        local lsmod_mods sys_mods hidden_mods d n
+        lsmod_mods=$(lsmod 2>/dev/null | awk 'NR>1 {print $1}' | tr '-' '_' | sort)
+        # Only LOADABLE modules expose /sys/module/<name>/initstate. Built-in components
+        # (acpi, block, apparmor, 8250 ...) have no initstate file and are not modules.
+        sys_mods=$(for d in /sys/module/*/initstate; do [[ -e "$d" ]] || continue; n=${d#/sys/module/}; echo "${n%/initstate}"; done | tr '-' '_' | sort)
         hidden_mods=$(comm -23 <(echo "$sys_mods") <(echo "$lsmod_mods") | head -n 20)
         if [[ -n "$hidden_mods" ]]; then
-            log_warn "Loaded kernel modules present in /sys/module but missing from lsmod (possible module-hiding rootkit; built-in modules also show here, verify manually):\n$hidden_mods"
+            log_crit "Loadable kernel modules present in /sys/module but missing from lsmod (module-hiding rootkit indicator):\n$hidden_mods"
             indicators=$((indicators + 1))
         else
-            log_pass "No hidden kernel modules detected."
+            log_pass "No hidden kernel modules detected (sysfs and lsmod agree on all loadable modules)."
         fi
     fi
 
     if [[ "$indicators" -eq 0 ]]; then
         log_pass "Behavioral rootkit scan: no anomalous process, preload, module or interface indicators found."
     else
-        log_crit "Behavioral rootkit scan: ${indicators} behavioral indicator(s) of compromise detected. Investigate the findings above (compare with chkrootkit/rkhunter output in section 6)."
+        echo -e "${RED}Behavioral rootkit scan: ${indicators} indicator(s) found (each already counted above). Investigate them and compare with the chkrootkit result in section 6.${NC}"
     fi
 }
 
@@ -4362,8 +4613,10 @@ cleanup_audit_footprint() {
         echo -e "  No packages were installed by this audit run - the system package set is unchanged."
     fi
 
-    # 2. Clean the package-manager cache downloaded during this run
-    if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
+    # 2. Clean the package-manager cache - only if this run installed something
+    if [[ ${#installed_list[@]} -eq 0 ]]; then
+        :
+    elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
         if run_sudo "${TOOL_BIN['apt-get']}" clean 2>/dev/null; then
             echo -e "  ${GREEN}OK${NC} APT archive cache cleaned (/var/cache/apt/archives)."
         fi
@@ -4375,15 +4628,14 @@ cleanup_audit_footprint() {
 
     # 3. Safety net: remove any leftover mktemp/temp files created by this script
     find "$REPORT_DIR" -maxdepth 1 -name "*.tmp" -type f -delete 2>/dev/null || true
-    find /tmp -maxdepth 1 -name "tmp.*" -user root -mmin -120 -size -100k -type f -delete 2>/dev/null || true
+    # (the private scratch dir $WORK_DIR is removed by the EXIT trap)
 
     # 4. Summarize what intentionally REMAINS after cleanup
-    echo -e "  ${CYAN}Kept intentionally:${NC}"
+    echo -e "  ${CYAN}Left on disk:${NC}"
     echo -e "    - Audit report        : ${CYAN}${REPORT_FILE}${NC}"
-    echo -e "    - Password dictionary : ${CYAN}${DICT_FILE}${NC} (cached for future runs)"
-    echo -e "    - Installed scanners  : security tools installed by this run (listed above)"
-    echo -e "    - History backups    : *.audit-backup files created before history cleaning"
-    echo -e "    - Security fixes     : permission/config remediations applied during the audit"
+    [[ "$FETCH_EXTERNAL_PASSWORDS" == true ]] && echo -e "    - Password dictionary : ${CYAN}${DICT_FILE}${NC} (cached for future runs)"
+    [[ "$CLEAN_HISTORY" == true ]] && echo -e "    - History backups     : *.audit-backup (contain the removed lines - delete when no longer needed)"
+    [[ "$AUTO_FIX" == true ]] && echo -e "    - Remediations        : permission/config fixes applied by --fix (see [OK] lines above)"
     echo -e "${GREEN}[OK] Post-audit cleanup completed.${NC}\n"
 }
 
@@ -4405,7 +4657,10 @@ print_scorecard() {
     # Weighted score: critical findings hurt much more than warnings.
     local score=100
     if [[ $TOTAL_CHECKS -gt 0 ]]; then
-        score=$(( 100 - (CRITICAL_COUNT * 10 + WARNING_COUNT * 2) ))
+        # Criticals weigh heavily; warnings are capped so many small suggestions cannot zero the score.
+        local warn_pen=$WARNING_COUNT
+        [[ $warn_pen -gt 25 ]] && warn_pen=25
+        score=$(( 100 - (CRITICAL_COUNT * 12 + warn_pen) ))
         [[ $score -lt 0 ]] && score=0
         [[ $score -gt 100 ]] && score=100
     fi
@@ -4437,9 +4692,15 @@ print_scorecard() {
     fi
 
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${GREEN}[OK] System Audit & Remediation Completed Successfully!${NC}"
+    local mode="report-only (no changes made)"
+    [[ "$AUTO_FIX" == true || "$INSTALL_MISSING_PKGS" == true || "$CLEAN_CACHE" == true || "$CLEAN_HISTORY" == true || "$AUTO_RESTART_SERVICES" == true ]] && mode="changes enabled via flags"
+    echo -e "${GREEN}[OK] System audit finished - mode: ${mode}.${NC}"
     echo -e "  Detailed Markdown Report Log: ${CYAN}${REPORT_FILE}${NC}"
     echo -e "${CYAN}=====================================================${NC}"
 }
 
 print_scorecard
+
+sleep 1   # let the tee/sed report pipeline flush before exiting
+[[ $CRITICAL_COUNT -gt 0 ]] && exit 1
+exit 0
