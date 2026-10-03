@@ -593,51 +593,156 @@ else
 fi
 
 # 5. Network Security, Active Connections & Tunneling Audit
-section "5/20" "Auditing Network Security, Active Connections & VPN Tunnels..."
+section "5/20" "Auditing Network Security, Firewall Rules, Listening Ports & VPN Tunnels..."
 
 audit_network_security_and_tunnels() {
-    # 1. Firewall Service Status
-    echo -e "${YELLOW}--- 1. Firewall Service Status ---${NC}"
-    if [[ "${TOOL_FOUND['systemctl']}" -eq 1 ]]; then
-        if systemctl is-active --quiet firewalld; then
-            log_pass "firewalld firewall service is active."
-        elif systemctl is-active --quiet ufw; then
-            log_pass "ufw firewall service is active."
-        else
-            log_warn "Firewall service (firewalld/ufw) is inactive!"
-            if [[ "$AUTO_RESTART_SERVICES" == true && "$AUTO_FIX" == true ]]; then
-                if systemctl list-unit-files 2>/dev/null | grep -q "^ufw\.service"; then
-                    restart_service "ufw" "activating firewall daemon"
-                elif systemctl list-unit-files 2>/dev/null | grep -q "^firewalld\.service"; then
-                    restart_service "firewalld" "activating firewall daemon"
-                fi
+    # 5.1 Firewall Configuration & Active Rule Audit (UFW / firewalld / nftables / iptables)
+    echo -e "${YELLOW}--- 5.1 Firewall Configuration & Active Rule Audit (UFW / firewalld / nftables / iptables) ---${NC}"
+    local firewall_active=false
+
+    # 1. UFW Audit
+    if command -v ufw &>/dev/null; then
+        local ufw_out
+        ufw_out=$(run_sudo ufw status verbose 2>/dev/null || ufw status verbose 2>/dev/null)
+        if [[ -n "$ufw_out" ]]; then
+            if [[ "$ufw_out" =~ "Status: active" ]]; then
+                firewall_active=true
+                local ufw_default
+                ufw_default=$(echo "$ufw_out" | grep -i "Default:" | head -n 1)
+                echo -e "  UFW Firewall Status: ${GREEN}ACTIVE${NC} (${ufw_default:-Default rules configured})"
+                log_pass "UFW packet filtering firewall is ACTIVE."
+            else
+                echo -e "  UFW Firewall Status: ${YELLOW}INACTIVE${NC}"
             fi
         fi
     fi
 
-    # 2. Public Listening TCP/UDP Ports
+    # 2. firewalld Audit
+    if command -v firewall-cmd &>/dev/null; then
+        local fw_state
+        fw_state=$(firewall-cmd --state 2>/dev/null)
+        if [[ "$fw_state" == "running" ]]; then
+            firewall_active=true
+            local active_zone
+            active_zone=$(firewall-cmd --get-active-zones 2>/dev/null | head -n 1)
+            echo -e "  firewalld Status: ${GREEN}RUNNING${NC} (Active Zone: ${active_zone:-default})"
+            log_pass "firewalld packet filtering firewall is RUNNING."
+        fi
+    fi
+
+    # 3. nftables Audit
+    if command -v nft &>/dev/null; then
+        local nft_rules
+        nft_rules=$(run_sudo nft list ruleset 2>/dev/null)
+        if [[ -n "$nft_rules" && "$nft_rules" =~ "table " ]]; then
+            firewall_active=true
+            local chain_cnt
+            chain_cnt=$(echo "$nft_rules" | grep -c "chain ")
+            echo -e "  nftables Status: ${GREEN}ACTIVE${NC} (${chain_cnt} active filtering chain(s))"
+            log_pass "nftables packet filtering ruleset verified."
+        fi
+    fi
+
+    # 4. iptables Audit
+    if command -v iptables &>/dev/null; then
+        local ipt_rules
+        ipt_rules=$(run_sudo iptables -L -n -v 2>/dev/null)
+        if [[ -n "$ipt_rules" ]]; then
+            local input_pol rule_count
+            input_pol=$(echo "$ipt_rules" | grep -E "^Chain INPUT" | awk '{print $4}')
+            rule_count=$(echo "$ipt_rules" | grep -c -E '^[[:space:]]*[0-9]+')
+            echo -e "  iptables IPv4 INPUT Policy : ${CYAN}${input_pol:-UNKNOWN}${NC} (${rule_count} active filtering rules)"
+
+            if [[ "$rule_count" -gt 0 || "$input_pol" == "(policy DROP)" || "$input_pol" == "(policy REJECT)" ]]; then
+                firewall_active=true
+            fi
+        fi
+    fi
+
+    if [[ "$firewall_active" == true ]]; then
+        log_pass "Active network packet filtering firewall verified."
+    else
+        log_crit "NO ACTIVE FIREWALL FILTERING: System has no active iptables/nftables/ufw filtering rules! All incoming network connections are unfiltered!"
+    fi
+
+    # 5.2 Open Listening TCP/UDP Ports & Associated Processes Audit (ss -tulpn)
+    echo -e "\n${YELLOW}--- 5.2 Open Listening TCP/UDP Ports & Associated Processes (ss -tulpn) ---${NC}"
     if [[ "${TOOL_FOUND['ss']}" -eq 1 ]]; then
-        echo -e "\n${YELLOW}--- 2. Public Listening TCP/UDP Ports ---${NC}"
-        local listen_ports
-        listen_ports=$(ss -tulpn 2>/dev/null | grep -E '0\.0\.0\.0|::|\*')
-        if [[ -n "$listen_ports" ]]; then
-            echo "$listen_ports"
+        local ss_output
+        ss_output=$(run_sudo ss -tulpn 2>/dev/null || ss -tulpn 2>/dev/null)
+        if [[ -n "$ss_output" ]]; then
+            local public_count=0
+            local local_count=0
+            local suspicious_services=()
+
+            echo -e "  ${CYAN}Active Listening Network Sockets:${NC}"
+            
+            while read -r netid state recvq sendq local_addr peer_addr proc; do
+                [[ -z "$local_addr" || "$netid" == "Netid" ]] && continue
+                
+                local port="${local_addr##*:}"
+                local addr_part="${local_addr%:*}"
+                
+                local proc_name="[Unknown/Root]"
+                if [[ "$proc" =~ users:\(\(\"([^\"]+)\" ]]; then
+                    proc_name="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$proc" =~ pid=([0-9]+) ]]; then
+                    local proc_pid="${BASH_REMATCH[1]}"
+                    proc_name="${proc_name} (PID: ${proc_pid})"
+                fi
+
+                local scope="Public"
+                if [[ "$addr_part" =~ ^127\. || "$addr_part" == "[::1]" ]]; then
+                    scope="Localhost"
+                    ((local_count++))
+                else
+                    ((public_count++))
+                    case "$port" in
+                        21) suspicious_services+=("FTP (Port 21, Unencrypted cleartext credentials)") ;;
+                        23) suspicious_services+=("Telnet (Port 23, Unencrypted cleartext shell access)") ;;
+                        25) suspicious_services+=("SMTP (Port 25, Plaintext mail relay)") ;;
+                        69) suspicious_services+=("TFTP (Port 69, Unauthenticated file transfer)") ;;
+                        80) echo -e "    - HTTP (Port 80): Plaintext web service active" ;;
+                        161|162) suspicious_services+=("SNMP (Port ${port}, Unencrypted network management)") ;;
+                        512|513|514) suspicious_services+=("Legacy Remote Shell R-Services (Port ${port})") ;;
+                        3306) suspicious_services+=("MySQL Database (Port 3306 exposed on public interface!)") ;;
+                        5432) suspicious_services+=("PostgreSQL Database (Port 5432 exposed on public interface!)") ;;
+                        6379) suspicious_services+=("Redis Cache (Port 6379 exposed on public interface!)") ;;
+                        27017) suspicious_services+=("MongoDB (Port 27017 exposed on public interface!)") ;;
+                        11211) suspicious_services+=("Memcached (Port 11211 exposed on public interface!)") ;;
+                        9200) suspicious_services+=("Elasticsearch (Port 9200 exposed on public interface!)") ;;
+                    esac
+                fi
+
+                printf "    - %-5s | %-20s | Port %-5s | Scope: %-9s | Process: %s\n" "$netid" "$addr_part" "$port" "$scope" "$proc_name"
+            done < <(echo "$ss_output" | awk 'NR>1')
+
+            log_pass "Listening Sockets Audit Summary: ${public_count} public socket(s), ${local_count} localhost-only socket(s)."
+
+            if [[ ${#suspicious_services[@]} -gt 0 ]]; then
+                local susp_msg
+                susp_msg=$(IFS=$'\n'; echo "${suspicious_services[*]}")
+                log_crit "RISKY / UNENCRYPTED PUBLIC LISTENING SERVICES DETECTED:\n${susp_msg}"
+            fi
+
+            local mdns_llmnr
+            mdns_llmnr=$(echo "$ss_output" | grep -E ':5353|:5355')
+            if [[ -n "$mdns_llmnr" ]]; then
+                log_warn "Active mDNS/LLMNR services found (5353/5355). Disable systemd-resolved LLMNR/MulticastDNS if not needed."
+            fi
         else
-            log_pass "No open public listening ports found."
+            log_pass "No active listening TCP/UDP sockets found."
         fi
+    fi
 
-        local mdns_llmnr
-        mdns_llmnr=$(ss -tuln 2>/dev/null | grep -E '5353|5355')
-        if [[ -n "$mdns_llmnr" ]]; then
-            log_warn "Active mDNS/LLMNR services found (5353/5355). Disable systemd-resolved LLMNR/MulticastDNS if not needed."
-        fi
-
-        # 3. Active Established Outbound Connections Audit
-        echo -e "\n${YELLOW}--- 3. Active Established Outbound Network Connections ---${NC}"
+    # 5.3 Active Established Outbound Connections Audit
+    echo -e "\n${YELLOW}--- 5.3 Active Established Outbound Network Connections ---${NC}"
+    if [[ "${TOOL_FOUND['ss']}" -eq 1 ]]; then
         local established_conns
-        established_conns=$(ss -tunp state established 2>/dev/null | grep -v '127\.0\.0\.1' | grep -v '::1')
+        established_conns=$(run_sudo ss -tunp state established 2>/dev/null | grep -v '127\.0\.0\.1' | grep -v '::1')
         if [[ -n "$established_conns" ]]; then
-            echo "$established_conns"
+            echo "$established_conns" | sed 's/^/  /'
             local conn_count
             conn_count=$(echo "$established_conns" | awk 'NR>1' | wc -l)
             log_pass "Audited ${conn_count} active established outbound network connection(s)."
@@ -646,18 +751,17 @@ audit_network_security_and_tunnels() {
         fi
     fi
 
-    # 4. VPN, Mesh & Tunneling Interfaces Audit
-    echo -e "\n${YELLOW}--- 4. Active VPN, Mesh & Tunneling Interfaces ---${NC}"
+    # 5.4 Active VPN, Mesh & Tunneling Interfaces Audit
+    echo -e "\n${YELLOW}--- 5.4 Active VPN, Mesh & Tunneling Interfaces ---${NC}"
     local vpn_ifaces
     vpn_ifaces=$(ip link show 2>/dev/null | grep -E 'tun[0-9]|tap[0-9]|wg[0-9]|tailscale|zerotier|zt[0-9]' | awk -F': ' '{print $2}')
     if [[ -n "$vpn_ifaces" ]]; then
-        echo -e "${CYAN}Active VPN / Mesh interfaces detected:${NC} ${vpn_ifaces}"
+        echo -e "  Active VPN / Mesh interfaces detected: ${CYAN}${vpn_ifaces}${NC}"
         log_pass "VPN/Mesh network interface(s) verified: ${vpn_ifaces}"
     else
-        echo -e "No active VPN/Mesh interfaces (WireGuard, OpenVPN, Tailscale, ZeroTier) detected."
+        echo -e "  No active VPN/Mesh interfaces (WireGuard, OpenVPN, Tailscale, ZeroTier) detected."
     fi
 
-    # Check VPN config permissions (/etc/wireguard, /etc/openvpn)
     local vpn_configs=()
     [[ -d "/etc/wireguard" ]] && while read -r f; do vpn_configs+=("$f"); done < <(find /etc/wireguard -type f 2>/dev/null)
     [[ -d "/etc/openvpn" ]] && while read -r f; do vpn_configs+=("$f"); done < <(find /etc/openvpn -type f 2>/dev/null)
@@ -2998,24 +3102,138 @@ audit_kernel_hardening() {
 }
 audit_kernel_hardening
 
-# 19. Network DNS & /etc/hosts Integrity Audit
-section "19/20" "Auditing DNS Settings & /etc/hosts Integrity..."
+# 19. Network DNS, Encrypted DNS (DoH/DoT) & /etc/hosts Integrity Audit
+section "19/20" "Auditing DNS Settings, Encrypted DNS (DoH/DoT) & /etc/hosts Integrity..."
+
 audit_dns_hosts() {
-    echo -e "${YELLOW}--- DNS Resolvers (/etc/resolv.conf) ---${NC}"
-    if [[ -f "/etc/resolv.conf" ]]; then
-        grep '^nameserver' /etc/resolv.conf | sed 's/^/  - /'
+    # 19.1 DNS Resolvers & /etc/resolv.conf Integrity Audit
+    echo -e "${YELLOW}--- 19.1 DNS Resolvers & /etc/resolv.conf Integrity Audit ---${NC}"
+    local resolv_file="/etc/resolv.conf"
+    
+    if [[ -L "$resolv_file" ]]; then
+        local link_target
+        link_target=$(readlink -f "$resolv_file" 2>/dev/null)
+        echo -e "  /etc/resolv.conf mode      : ${CYAN}Symlink -> ${link_target}${NC}"
+        log_pass "/etc/resolv.conf is managed dynamically via symlink (${link_target})."
+    elif [[ -f "$resolv_file" ]]; then
+        local r_perm r_owner
+        r_perm=$(stat -c "%a" "$resolv_file" 2>/dev/null)
+        r_owner=$(stat -c "%U:%G" "$resolv_file" 2>/dev/null)
+        echo -e "  /etc/resolv.conf mode      : ${CYAN}Static File (Perms: ${r_perm}, Owner: ${r_owner})${NC}"
+        if [[ "$r_perm" =~ ^(644|600|400)$ ]]; then
+            log_pass "/etc/resolv.conf file permissions verified (${r_perm})."
+        else
+            log_warn "Loose permissions on /etc/resolv.conf (${r_perm})! Non-root processes might modify DNS servers."
+        fi
+    else
+        log_warn "/etc/resolv.conf file is missing!"
     fi
 
-    echo -e "\n${YELLOW}--- /etc/hosts Non-Standard Entries Check ---${NC}"
+    # Check immutable attribute (+i)
+    if command -v lsattr &>/dev/null && [[ -f "$resolv_file" ]]; then
+        local attr
+        attr=$(lsattr "$resolv_file" 2>/dev/null | awk '{print $1}')
+        if [[ "$attr" =~ i ]]; then
+            log_pass "/etc/resolv.conf has immutable attribute (+i) set against unauthorized tampering."
+        fi
+    fi
+
+    # Extract nameservers
+    if [[ -f "$resolv_file" ]]; then
+        echo -e "\n  ${CYAN}Configured Nameservers in /etc/resolv.conf:${NC}"
+        local nameservers=()
+        while read -r line; do
+            [[ -z "$line" ]] && continue
+            local ns_ip
+            ns_ip=$(echo "$line" | awk '{print $2}')
+            [[ -z "$ns_ip" ]] && continue
+            nameservers+=("$ns_ip")
+            
+            local ns_type="Public / Upstream DNS"
+            if [[ "$ns_ip" =~ ^127\. || "$ns_ip" == "::1" ]]; then
+                ns_type="Local Stub Resolver (systemd-resolved / dnsmasq)"
+            elif [[ "$ns_ip" =~ ^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
+                ns_type="Local Gateway / LAN Router DNS"
+            elif [[ "$ns_ip" == "1.1.1.1" || "$ns_ip" == "1.0.0.1" ]]; then
+                ns_type="Cloudflare Public DNS (Secured)"
+            elif [[ "$ns_ip" == "8.8.8.8" || "$ns_ip" == "8.8.4.4" ]]; then
+                ns_type="Google Public DNS"
+            elif [[ "$ns_ip" == "9.9.9.9" || "$ns_ip" == "149.112.112.112" ]]; then
+                ns_type="Quad9 Threat-Blocking DNS"
+            elif [[ "$ns_ip" == "94.140.14.14" || "$ns_ip" == "94.140.15.15" ]]; then
+                ns_type="AdGuard Public DNS"
+            fi
+
+            echo -e "    - ${CYAN}${ns_ip}${NC} (${ns_type})"
+        done < <(grep '^nameserver' "$resolv_file" 2>/dev/null)
+
+        if [[ ${#nameservers[@]} -eq 0 ]]; then
+            log_crit "No active nameservers defined in /etc/resolv.conf! DNS resolution will fail!"
+        else
+            log_pass "Extracted ${#nameservers[@]} active DNS nameserver(s)."
+        fi
+    fi
+
+    # 19.2 Encrypted DNS (DoH / DoT), DNSSEC & Resolver Security Audit
+    echo -e "\n${YELLOW}--- 19.2 Encrypted DNS (DoH / DoT), DNSSEC & Resolver Security Audit ---${NC}"
+    if command -v resolvectl &>/dev/null; then
+        local rctl_status
+        rctl_status=$(resolvectl status 2>/dev/null)
+        if [[ -n "$rctl_status" ]]; then
+            local doh_line dnssec_line
+            doh_line=$(echo "$rctl_status" | grep -i "DNSOverTLS" | head -n 1)
+            dnssec_line=$(echo "$rctl_status" | grep -i "DNSSEC" | head -n 1)
+
+            echo -e "  systemd-resolved DoT Status : ${CYAN}${doh_line:-Not reported}${NC}"
+            echo -e "  systemd-resolved DNSSEC     : ${CYAN}${dnssec_line:-Not reported}${NC}"
+
+            if [[ "$doh_line" =~ yes|opportunistic ]]; then
+                log_pass "DNS-over-TLS (DoT) is active in systemd-resolved."
+            else
+                log_warn "DNS-over-TLS (DoT) is NOT enabled in systemd-resolved (DNS queries are transmitted in plain text)."
+            fi
+
+            if [[ "$dnssec_line" =~ yes|allow-downgrade ]]; then
+                log_pass "DNSSEC validation is active in systemd-resolved."
+            else
+                echo -e "  ${YELLOW}Tip: Consider enabling DNSSEC in /etc/systemd/resolved.conf (DNSSEC=allow-downgrade).${NC}"
+            fi
+        fi
+    fi
+
+    local doh_proxies=("cloudflared" "dnscrypt-proxy" "stubby" "adguardhome" "dnsmasq" "unbound")
+    local found_doh_daemon=""
+    for proxy in "${doh_proxies[@]}"; do
+        if pgrep -x "$proxy" &>/dev/null; then
+            found_doh_daemon+="${proxy} "
+        fi
+    done
+
+    if [[ -n "$found_doh_daemon" ]]; then
+        log_pass "Active Encrypted DNS / DoH Proxy Daemon(s) detected: ${found_doh_daemon}"
+    fi
+
+    # 19.3 DNS Resolution Hijacking & /etc/hosts Integrity Audit
+    echo -e "\n${YELLOW}--- 19.3 DNS Resolution Hijacking & /etc/hosts Integrity Audit ---${NC}"
     if [[ -f "/etc/hosts" ]]; then
         local custom_hosts
-        custom_hosts=$(grep -vE '^\s*#|localhost|127\.0\.0\.1|127\.0\.1\.1|::1|fe00::0|ff02::' /etc/hosts | grep -v '^\s*$')
+        custom_hosts=$(grep -vE '^\s*#|localhost|127\.0\.0\.1|127\.0\.1\.1|::1|fe00::0|ff02::' /etc/hosts 2>/dev/null | grep -v '^\s*$')
         if [[ -n "$custom_hosts" ]]; then
             echo -e "${CYAN}Custom /etc/hosts entries:${NC}"
-            echo "$custom_hosts"
+            echo "$custom_hosts" | sed 's/^/  - /'
+            log_warn "Custom static /etc/hosts overrides detected. Verify that no security or update domains are hijacked."
         else
             log_pass "No unusual custom entries in /etc/hosts."
         fi
+    fi
+
+    echo -e "  Testing functional DNS resolution (google.com)..."
+    local test_ip
+    test_ip=$(getent ahosts google.com 2>/dev/null | head -n 1 | awk '{print $1}')
+    if [[ -n "$test_ip" ]]; then
+        log_pass "System DNS resolution functional (google.com -> ${test_ip})."
+    else
+        log_warn "System DNS resolution test failed or timed out for google.com!"
     fi
 }
 audit_dns_hosts
