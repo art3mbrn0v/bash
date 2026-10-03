@@ -1257,6 +1257,43 @@ audit_directory_permissions() {
     if [[ "$luks_keys_found" -eq 0 ]]; then
         log_pass "No LUKS keyfiles or crypttab key references found in temporary directories (/tmp, /var/tmp, /dev/shm)."
     fi
+
+    # 8. Orphaned Files & Directories Without Owner or Group (-nouser / -nogroup)
+    echo -e "\n${CYAN}8. Orphaned Files & Directories Without Owner or Group Audit (-nouser / -nogroup):${NC}"
+    local nouser_list
+    nouser_list=$(run_sudo find /etc /var /opt /home /tmp /usr /srv /boot -maxdepth 4 \( -nouser -o -nogroup \) ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null | head -n 20)
+    if [[ -n "$nouser_list" ]]; then
+        local nouser_cnt
+        nouser_cnt=$(echo "$nouser_list" | wc -l)
+        log_warn "Orphaned files/directories without valid owner or group found (${nouser_cnt} items):\n$(echo "$nouser_list" | sed 's/^/  - /')"
+    else
+        log_pass "No orphaned files without owner or group (-nouser / -nogroup) found on the system."
+    fi
+
+    # 9. World-Writable Directories & Sticky Bit (+t) Integrity Audit
+    echo -e "\n${CYAN}9. World-Writable Directories & Sticky Bit (+t) Integrity Audit:${NC}"
+    local ww_dirs
+    ww_dirs=$(run_sudo find /tmp /var/tmp /dev/shm /var /etc /opt /home /usr -type d -perm -0002 ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null)
+    if [[ -n "$ww_dirs" ]]; then
+        local missing_sticky=0
+        while read -r wdir; do
+            [[ -z "$wdir" ]] && continue
+            local wperm
+            wperm=$(run_sudo stat -c "%a" "$wdir" 2>/dev/null)
+            if [[ "$wperm" =~ ^[1357] ]]; then
+                echo -e "  - World-Writable Dir: ${CYAN}${wdir}${NC} (Mode: ${wperm}) [${GREEN}✓ Sticky bit +t set${NC}]"
+            else
+                log_crit "INSECURE WORLD-WRITABLE DIRECTORY: '${wdir}' (Mode: ${wperm}) is world-writable WITHOUT sticky bit (+t)! Any local user can delete or tamper with other users' files!"
+                ((missing_sticky++))
+            fi
+        done <<< "$ww_dirs"
+
+        if [[ "$missing_sticky" -eq 0 ]]; then
+            log_pass "All discovered world-writable directories have sticky bit (+t) enabled."
+        fi
+    else
+        log_pass "No world-writable directories detected."
+    fi
 }
 
 audit_directory_permissions
@@ -2944,22 +2981,52 @@ audit_shell_configs_and_aliases() {
 
 audit_shell_configs_and_aliases
 
-# 14. SUID / SGID Executable File Audit
-section "14/20" "Auditing SUID / SGID Files for Privilege Escalation Risk..."
+# 14. SUID / SGID Executable File Audit & GTFOBins Privilege Escalation Risk
+section "14/20" "Auditing SUID / SGID Executables & Privilege Escalation Risks..."
+
 audit_suid_files() {
-    echo -e "${YELLOW}--- Scanning for SUID/SGID Binaries in Volatile / Non-Standard Paths ---${NC}"
+    echo -e "${YELLOW}--- 14.1 SUID/SGID Binaries in Volatile & Non-Standard Paths ---${NC}"
     local suspicious_suid
-    suspicious_suid=$(find /tmp /var/tmp /dev/shm /home -perm -4000 -o -perm -2000 2>/dev/null)
+    suspicious_suid=$(run_sudo find /tmp /var/tmp /dev/shm /home /opt /var/www /srv -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null)
     if [[ -n "$suspicious_suid" ]]; then
-        log_crit "SUID/SGID files found in non-standard/writable paths:\n$suspicious_suid"
+        log_crit "SUID/SGID executable files found in volatile / user / web paths:\n$(echo "$suspicious_suid" | sed 's/^/  - /')"
     else
-        log_pass "No SUID/SGID files found in volatile/user paths (/tmp, /dev/shm, /home)."
+        log_pass "No SUID/SGID files found in volatile or user paths (/tmp, /dev/shm, /home, /opt, /var/www)."
     fi
 
-    echo -e "\n${YELLOW}--- System SUID Executables Count ---${NC}"
-    local suid_count
-    suid_count=$(find /usr/bin /usr/sbin /bin /sbin -perm -4000 2>/dev/null | wc -l)
-    echo -e "Total SUID binaries in system paths: ${CYAN}${suid_count}${NC}"
+    echo -e "\n${YELLOW}--- 14.2 System-Wide SUID Binaries & GTFOBins Privilege Escalation Risk ---${NC}"
+    local suid_files=()
+    while read -r sfile; do
+        [[ -f "$sfile" ]] && suid_files+=("$sfile")
+    done < <(run_sudo find /usr/bin /usr/sbin /bin /sbin /usr/lib /usr/libexec -type f -perm -4000 2>/dev/null)
+
+    echo -e "  Total SUID binaries in system paths: ${CYAN}${#suid_files[@]}${NC}"
+
+    local gtfobins_pattern="find|vim|vi|bash|sh|python|python3|perl|php|awk|less|more|nmap|env|gdb|strace|tcpdump|tar|cp|mv|base64|cpulimit|docker|date|dd|flock|ionice|nice|taskset|time|timeout|watch|xargs|zip|zsh"
+    local gtfobins_suid=()
+
+    for sfile in "${suid_files[@]}"; do
+        local fname
+        fname=$(basename "$sfile")
+        if [[ "$fname" =~ ^($gtfobins_pattern)$ ]]; then
+            gtfobins_suid+=("$sfile")
+        fi
+    done
+
+    if [[ ${#gtfobins_suid[@]} -gt 0 ]]; then
+        log_crit "DANGEROUS SUID GTFOBINS BINARIES DETECTED:\n$(printf '  - %s\n' "${gtfobins_suid[@]}")\nThese SUID binaries allow immediate local privilege escalation to root shell!"
+    else
+        log_pass "No GTFOBins privilege escalation binaries have SUID flags enabled."
+    fi
+
+    echo -e "\n${YELLOW}--- 14.3 World-Writable System Files Audit ---${NC}"
+    local ww_files
+    ww_files=$(run_sudo find /etc /var /opt /usr /boot -type f -perm -0002 ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null | head -n 20)
+    if [[ -n "$ww_files" ]]; then
+        log_crit "WORLD-WRITABLE FILES DETECTED in system paths:\n$(echo "$ww_files" | sed 's/^/  - /')\nAny unprivileged user can modify or replace these files!"
+    else
+        log_pass "No world-writable files found in system directories (/etc, /var, /usr, /opt)."
+    fi
 }
 audit_suid_files
 
