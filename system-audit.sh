@@ -565,32 +565,163 @@ else
     echo "No DNF or APT package manager available for CVE checks."
 fi
 
-# 4. SSH Configuration Audit
-section "4/20" "Auditing SSH Daemon Configuration..."
-SSHD_CONFIG="/etc/ssh/sshd_config"
-if [[ -f "$SSHD_CONFIG" ]] || [[ -d "/etc/ssh/sshd_config.d" ]]; then
-    ROOT_LOGIN=$(run_sudo sshd -T 2>/dev/null | grep -i "^permitrootlogin" || echo "permitrootlogin unknown")
-    PASS_AUTH=$(run_sudo sshd -T 2>/dev/null | grep -i "^passwordauthentication" || echo "passwordauthentication unknown")
-    EMPTY_PASS=$(run_sudo sshd -T 2>/dev/null | grep -i "^permitemptypasswords" || echo "permitemptypasswords unknown")
+# 4. SSH Daemon & Remote Access Security Audit
+section "4/20" "Auditing SSH Daemon Configuration, Ciphers & Security Directives..."
 
-    echo "Current SSH Settings:"
-    echo "  - $ROOT_LOGIN"
-    echo "  - $PASS_AUTH"
-    echo "  - $EMPTY_PASS"
+audit_ssh_daemon_config() {
+    local sshd_config="/etc/ssh/sshd_config"
+    local sshd_dir="/etc/ssh/sshd_config.d"
+    
+    if [[ ! -f "$sshd_config" && ! -d "$sshd_dir" ]]; then
+        echo -e "  ${YELLOW}OpenSSH Daemon config not found (/etc/ssh/sshd_config missing). SSH daemon may not be installed.${NC}"
+        return 0
+    fi
 
-    if [[ "$ROOT_LOGIN" =~ "yes" ]]; then
-        log_warn "Recommendation: Set 'PermitRootLogin no' or 'prohibit-password' in /etc/ssh/sshd_config"
-    else
-        log_pass "Root SSH login is restricted."
+    echo -e "${YELLOW}--- 4.1 SSH Daemon Effective Configuration & Authentication Directives ---${NC}"
+
+    local sshd_eval=""
+    if command -v sshd &>/dev/null; then
+        sshd_eval=$(run_sudo sshd -T 2>/dev/null || sshd -T 2>/dev/null)
     fi
-    if [[ "$PASS_AUTH" =~ "yes" ]]; then
-        log_warn "Recommendation: Consider disabling PasswordAuthentication in favor of SSH Keys"
+
+    get_ssh_param() {
+        local param="$1"
+        local default_val="$2"
+        local val=""
+
+        if [[ -n "$sshd_eval" ]]; then
+            val=$(echo "$sshd_eval" | grep -i "^${param} " | head -n 1 | awk '{print $2}')
+        fi
+
+        if [[ -z "$val" && -f "$sshd_config" ]]; then
+            val=$(grep -v '^\s*#' "$sshd_config" 2>/dev/null | grep -i "^${param}" | head -n 1 | awk '{print $2}')
+        fi
+
+        if [[ -z "$val" && -d "$sshd_dir" ]]; then
+            val=$(grep -v '^\s*#' "$sshd_dir"/*.conf 2>/dev/null | grep -i "^${param}" | head -n 1 | awk '{print $2}')
+        fi
+
+        echo "${val:-$default_val}"
+    }
+
+    # 1. SSH Listening Port
+    local ssh_port
+    ssh_port=$(get_ssh_param "port" "22")
+    echo -e "  SSH Listening Port          : ${CYAN}${ssh_port}${NC}"
+    if [[ "$ssh_port" == "22" ]]; then
+        echo -e "  ${YELLOW}Tip: SSH daemon is running on standard port 22. Changing to a non-standard port reduces automated bot brute-force noise.${NC}"
     else
-        log_pass "SSH password authentication is disabled."
+        log_pass "SSH daemon running on custom non-standard port (${ssh_port})."
     fi
-else
-    echo "SSHD config not found or sshd not installed."
-fi
+
+    # 2. PermitRootLogin
+    local root_login
+    root_login=$(get_ssh_param "permitrootlogin" "prohibit-password")
+    echo -e "  PermitRootLogin             : ${CYAN}${root_login}${NC}"
+    if [[ "$root_login" == "yes" ]]; then
+        log_crit "PermitRootLogin is enabled ('yes')! Direct root SSH login allows brute-force attacks against the root account! Recommended: 'no' or 'prohibit-password'."
+    elif [[ "$root_login" == "prohibit-password" || "$root_login" == "without-password" ]]; then
+        log_pass "PermitRootLogin set to '${root_login}' (Root SSH login allowed via SSH key only)."
+    else
+        log_pass "PermitRootLogin set to 'no' (Direct root SSH login disabled)."
+    fi
+
+    # 3. PasswordAuthentication
+    local pass_auth
+    pass_auth=$(get_ssh_param "passwordauthentication" "yes")
+    echo -e "  PasswordAuthentication      : ${CYAN}${pass_auth}${NC}"
+    if [[ "$pass_auth" == "yes" ]]; then
+        log_warn "PasswordAuthentication is enabled ('yes'). Password brute-force attacks are possible. Recommended: Disable password authentication in favor of SSH Keys ('PasswordAuthentication no')."
+    else
+        log_pass "PasswordAuthentication is disabled (Enforced SSH key authentication)."
+    fi
+
+    # 4. PermitEmptyPasswords
+    local empty_pass
+    empty_pass=$(get_ssh_param "permitemptypasswords" "no")
+    echo -e "  PermitEmptyPasswords        : ${CYAN}${empty_pass}${NC}"
+    if [[ "$empty_pass" == "yes" ]]; then
+        log_crit "PermitEmptyPasswords is enabled ('yes')! Accounts with blank passwords can log in via SSH!"
+    else
+        log_pass "PermitEmptyPasswords is set to 'no'."
+    fi
+
+    # 5. PubkeyAuthentication
+    local pubkey_auth
+    pubkey_auth=$(get_ssh_param "pubkeyauthentication" "yes")
+    echo -e "  PubkeyAuthentication        : ${CYAN}${pubkey_auth}${NC}"
+    if [[ "$pubkey_auth" == "no" ]]; then
+        log_warn "PubkeyAuthentication is disabled! SSH key authentication is turned off."
+    else
+        log_pass "PubkeyAuthentication is enabled."
+    fi
+
+    # 6. X11Forwarding
+    local x11_fwd
+    x11_fwd=$(get_ssh_param "x11forwarding" "no")
+    echo -e "  X11Forwarding               : ${CYAN}${x11_fwd}${NC}"
+    if [[ "$x11_fwd" == "yes" ]]; then
+        log_warn "X11Forwarding is enabled ('yes'). X11 display redirection increases attack surface unless required."
+    else
+        log_pass "X11Forwarding is disabled."
+    fi
+
+    # 7. MaxAuthTries
+    local max_tries
+    max_tries=$(get_ssh_param "maxauthtries" "6")
+    echo -e "  MaxAuthTries                : ${CYAN}${max_tries}${NC}"
+    if [[ "$max_tries" -gt 4 ]]; then
+        log_warn "MaxAuthTries is set to ${max_tries} (Recommended: <= 4 to mitigate brute-force attempts)."
+    else
+        log_pass "MaxAuthTries configuration verified (${max_tries})."
+    fi
+
+    # 4.2 Ciphers, MACs & Key Exchange (KEX) Cryptographic Algorithms Audit
+    echo -e "\n${YELLOW}--- 4.2 SSH Cryptographic Algorithms Audit (Ciphers, MACs, KEX) ---${NC}"
+
+    local ciphers_val macs_val kex_val
+    ciphers_val=$(get_ssh_param "ciphers" "")
+    macs_val=$(get_ssh_param "macs" "")
+    kex_val=$(get_ssh_param "kexalgorithms" "")
+
+    local weak_ciphers_pattern="3des-cbc|blowfish-cbc|cast128-cbc|aes128-cbc|aes192-cbc|aes256-cbc|arcfour|none"
+    if [[ -n "$ciphers_val" ]]; then
+        echo -e "  Configured Ciphers          : ${CYAN}${ciphers_val}${NC}"
+        local found_weak_ciphers
+        found_weak_ciphers=$(echo "$ciphers_val" | grep -Ei "$weak_ciphers_pattern")
+        if [[ -n "$found_weak_ciphers" ]]; then
+            log_crit "Weak / Obsolete SSH Ciphers enabled: ${found_weak_ciphers}! Recommended: chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com."
+        else
+            log_pass "SSH Cipher suite configuration verified (only strong AEAD/GCM ciphers configured)."
+        fi
+    fi
+
+    local weak_macs_pattern="hmac-md5|hmac-md5-96|hmac-sha1|hmac-sha1-96|umac-64@openssh.com"
+    if [[ -n "$macs_val" ]]; then
+        echo -e "  Configured MACs             : ${CYAN}${macs_val}${NC}"
+        local found_weak_macs
+        found_weak_macs=$(echo "$macs_val" | grep -Ei "$weak_macs_pattern")
+        if [[ -n "$found_weak_macs" ]]; then
+            log_warn "Weak / Obsolete SSH MAC Algorithms enabled: ${found_weak_macs}! Recommended: hmac-sha2-512-etm@openssh.com, hmac-sha2-256-etm@openssh.com."
+        else
+            log_pass "SSH MAC Algorithms verified."
+        fi
+    fi
+
+    local weak_kex_pattern="diffie-hellman-group1-sha1|diffie-hellman-group14-sha1|diffie-hellman-group-exchange-sha1"
+    if [[ -n "$kex_val" ]]; then
+        echo -e "  Configured KEX Algorithms   : ${CYAN}${kex_val}${NC}"
+        local found_weak_kex
+        found_weak_kex=$(echo "$kex_val" | grep -Ei "$weak_kex_pattern")
+        if [[ -n "$found_weak_kex" ]]; then
+            log_warn "Weak / Obsolete SSH Key Exchange (KEX) algorithms enabled: ${found_weak_kex}! Recommended: curve25519-dalek@coderberg.org, curve25519-sha256, diffie-hellman-group16-sha512."
+        else
+            log_pass "SSH Key Exchange (KEX) algorithms verified."
+        fi
+    fi
+}
+
+audit_ssh_daemon_config
 
 # 5. Network Security, Active Connections & Tunneling Audit
 section "5/20" "Auditing Network Security, Firewall Rules, Listening Ports & VPN Tunnels..."
@@ -2819,50 +2950,115 @@ audit_persistence() {
 }
 audit_persistence
 
-# 16. SSH authorized_keys Audit (All Users)
-section "16/20" "Auditing SSH Authorized Keys Across All Users..."
+# 16. SSH authorized_keys & Remote Access Security Audit (All Users)
+section "16/20" "Auditing SSH Authorized Keys & Remote Access Permissions (All Users)..."
+
 audit_authorized_keys() {
     local keys_count=0
     local weak_keys_found=0
+    local insecure_perms_found=0
+    local unrestricted_admin_keys=0
+
+    echo -e "${YELLOW}--- Auditing SSH Authorized Keys Across All System Accounts ---${NC}"
 
     while IFS=: read -r username password uid gid gecos home shell; do
-        local auth_keys="$home/.ssh/authorized_keys"
-        if [[ -f "$auth_keys" ]]; then
-            local key_num
-            key_num=$(grep -v '^#' "$auth_keys" | grep -v '^\s*$' | wc -l)
-            if [[ "$key_num" -gt 0 ]]; then
-                ((keys_count += key_num))
-                echo -e "  - User ${CYAN}${username}${NC}: ${key_num} authorized key(s) in ${auth_keys}"
-                if [[ "$username" == "root" ]]; then
-                    log_warn "Root account has SSH authorized keys configured in ${auth_keys}!"
+        [[ -d "$home" ]] || continue
+
+        local ssh_dir="$home/.ssh"
+        if [[ -d "$ssh_dir" ]]; then
+            local dir_perm dir_owner
+            dir_perm=$(stat -c "%a" "$ssh_dir" 2>/dev/null)
+            dir_owner=$(stat -c "%U:%G" "$ssh_dir" 2>/dev/null)
+            if [[ "$dir_perm" =~ ^(755|775|777)$ ]]; then
+                log_crit "User '${username}': Loose permissions on ${ssh_dir} (${dir_perm})! Directory should be 700 to prevent key tampering."
+                ((insecure_perms_found++))
+            fi
+        fi
+
+        local auth_files=(
+            "$home/.ssh/authorized_keys"
+            "$home/.ssh/authorized_keys2"
+        )
+
+        for auth_keys in "${auth_files[@]}"; do
+            if [[ -f "$auth_keys" ]]; then
+                local file_perm file_owner
+                file_perm=$(stat -c "%a" "$auth_keys" 2>/dev/null)
+                file_owner=$(stat -c "%U:%G" "$auth_keys" 2>/dev/null)
+
+                if [[ "$file_perm" =~ ^(644|664|666|777)$ ]]; then
+                    log_crit "User '${username}': Loose permissions on ${auth_keys} (${file_perm})! File is readable/writable by group or others. Recommended: 600."
+                    ((insecure_perms_found++))
                 fi
 
-                # Key type analysis
-                while read -r ktype key_data comment; do
+                while read -r raw_line; do
+                    [[ -z "$raw_line" || "$raw_line" =~ ^\s*# ]] && continue
+                    ((keys_count++))
+
+                    local key_options=""
+                    local ktype=""
+                    local comment=""
+
+                    if [[ "$raw_line" =~ ^(command|from|environment|no-|principals|restrict|cert-authority|tunnel) ]]; then
+                        key_options=$(echo "$raw_line" | awk '{print $1}')
+                        ktype=$(echo "$raw_line" | awk '{print $2}')
+                        comment=$(echo "$raw_line" | awk '{print $NF}')
+                    else
+                        ktype=$(echo "$raw_line" | awk '{print $1}')
+                        comment=$(echo "$raw_line" | awk '{print $NF}')
+                    fi
+
+                    local is_admin=false
+                    if [[ "$uid" -eq 0 || "$username" == "root" ]]; then
+                        is_admin=true
+                    elif groups "$username" 2>/dev/null | grep -qE '\b(sudo|wheel|admin)\b'; then
+                        is_admin=true
+                    fi
+
+                    if [[ "$is_admin" == true ]]; then
+                        if [[ "$raw_line" != *"from="* ]]; then
+                            log_warn "User '${username}' (Administrative Account): Authorized key '${comment}' has NO 'from=\"IP\"' restriction! Key can connect from any remote host."
+                            ((unrestricted_admin_keys++))
+                        else
+                            local from_val
+                            from_val=$(echo "$raw_line" | grep -o 'from="[^"]*"' || echo "from=restricted")
+                            log_pass "User '${username}': Authorized key '${comment}' is IP-restricted (${from_val})."
+                        fi
+                    fi
+
                     case "$ktype" in
                         ssh-dss|dss)
-                            log_crit "User '${username}': Obsolete & insecure DSA key found in ${auth_keys} (${comment:-no comment})!"
+                            log_crit "User '${username}': Obsolete & insecure DSA key in ${auth_keys} ('${comment}')! DSA 1024-bit keys are cryptographically broken."
                             ((weak_keys_found++))
                             ;;
                         ssh-rsa)
-                            echo -e "    Key: ${CYAN}RSA${NC} (${comment:-no comment})"
+                            echo -e "    - User ${CYAN}${username}${NC}: RSA Key ('${comment:-no comment}')"
                             ;;
                         ssh-ed25519)
-                            echo -e "    Key: ${GREEN}Ed25519 (Strong modern standard)${NC} (${comment:-no comment})"
+                            echo -e "    - User ${CYAN}${username}${NC}: ${GREEN}Ed25519 Key${NC} ('${comment:-no comment}')"
                             ;;
                         ecdsa-sha2-*)
-                            echo -e "    Key: ${GREEN}ECDSA${NC} (${comment:-no comment})"
+                            echo -e "    - User ${CYAN}${username}${NC}: ${GREEN}ECDSA Key${NC} ('${comment:-no comment}')"
                             ;;
                     esac
-                done < <(grep -v '^#' "$auth_keys" | grep -v '^\s*$')
+
+                done < "$auth_keys"
             fi
-        fi
+        done
     done < /etc/passwd
 
+    if [[ -f "/etc/ssh/authorized_keys" ]]; then
+        local global_key_cnt
+        global_key_cnt=$(grep -v '^#' /etc/ssh/authorized_keys 2>/dev/null | grep -v '^\s*$' | wc -l)
+        if [[ "$global_key_cnt" -gt 0 ]]; then
+            log_warn "Global SSH authorized_keys file detected (/etc/ssh/authorized_keys) containing ${global_key_cnt} key(s)."
+        fi
+    fi
+
     if [[ "$keys_count" -eq 0 ]]; then
-        log_pass "No authorized_keys files found."
-    elif [[ "$weak_keys_found" -eq 0 ]]; then
-        log_pass "Discovered ${keys_count} SSH authorized key(s) across user accounts (all algorithms secure)."
+        log_pass "No SSH authorized_keys files found across system user accounts."
+    else
+        log_pass "Audited ${keys_count} SSH authorized key(s) across all system users."
     fi
 }
 audit_authorized_keys
