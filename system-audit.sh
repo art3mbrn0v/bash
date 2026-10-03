@@ -2092,7 +2092,46 @@ PYEOF
             echo -e "${YELLOW}python3 not installed. Skipping automated weak password dictionary scan.${NC}"
         fi
 
-        # 3. Password Expiration Policy & Aging Audit
+        # 10.6 System Password Expiration & Aging Policies (/etc/login.defs & chage)
+        echo -e "\n${YELLOW}--- 10.6 System Password Expiration & Aging Policies (/etc/login.defs & chage) ---${NC}"
+        
+        if [[ -f "/etc/login.defs" ]]; then
+            local def_max def_min def_warn def_umask def_enc
+            def_max=$(grep -E "^\s*PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}')
+            def_min=$(grep -E "^\s*PASS_MIN_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}')
+            def_warn=$(grep -E "^\s*PASS_WARN_AGE" /etc/login.defs 2>/dev/null | awk '{print $2}')
+            def_umask=$(grep -E "^\s*UMASK" /etc/login.defs 2>/dev/null | awk '{print $2}')
+            def_enc=$(grep -E "^\s*ENCRYPT_METHOD" /etc/login.defs 2>/dev/null | awk '{print $2}')
+
+            echo -e "  /etc/login.defs Default Policies:"
+            echo -e "    - PASS_MAX_DAYS : ${CYAN}${def_max:-99999}${NC}"
+            echo -e "    - PASS_MIN_DAYS : ${CYAN}${def_min:-0}${NC}"
+            echo -e "    - PASS_WARN_AGE : ${CYAN}${def_warn:-7}${NC}"
+            echo -e "    - UMASK         : ${CYAN}${def_umask:-022}${NC}"
+            echo -e "    - ENCRYPT_METHOD: ${CYAN}${def_enc:-YESCRYPT}${NC}"
+
+            if [[ -n "$def_max" && "$def_max" -ge 99999 ]]; then
+                log_warn "PASS_MAX_DAYS in /etc/login.defs is set to 99999 (Default password expiration is disabled). Recommended: <= 90 or <= 180 days."
+            else
+                log_pass "System PASS_MAX_DAYS policy verified (${def_max} days)."
+            fi
+
+            if [[ -n "$def_min" && "$def_min" -eq 0 ]]; then
+                log_warn "PASS_MIN_DAYS in /etc/login.defs is 0 (Users can change password multiple times in the same day). Recommended: >= 1 day."
+            fi
+
+            if [[ "$def_umask" =~ ^(022|002)$ ]]; then
+                log_warn "Default system UMASK in /etc/login.defs is ${def_umask} (Group/world readable default files). Recommended: 027 or 077."
+            else
+                log_pass "Default system UMASK policy verified (${def_umask:-027})."
+            fi
+
+            if [[ "$def_enc" =~ DES|MD5 ]]; then
+                log_crit "Obsolete & insecure password encryption method '${def_enc}' in /etc/login.defs! Upgrade to SHA512 or YESCRYPT."
+            fi
+        fi
+
+        # Password Aging & Expiration Audit (/etc/shadow)
         echo -e "\n${CYAN}Password Aging & Expiration Audit (/etc/shadow):${NC}"
         local current_days=$(( $(date +%s) / 86400 ))
         local expired_accts=""
@@ -2122,8 +2161,8 @@ PYEOF
         fi
     fi
 
-    # --- 10.6 Sudoers Hardening & NOPASSWD Audit ---
-    echo -e "\n${YELLOW}--- 10.6 Sudoers Hardening & NOPASSWD Audit ---${NC}"
+    # --- 10.7 Sudoers Hardening & NOPASSWD Audit ---
+    echo -e "\n${YELLOW}--- 10.7 Sudoers Hardening & NOPASSWD Audit ---${NC}"
     local sudoers_files=("/etc/sudoers")
     [[ -d "/etc/sudoers.d" ]] && while read -r sf; do [[ -f "$sf" ]] && sudoers_files+=("$sf"); done < <(find /etc/sudoers.d -type f 2>/dev/null)
 
