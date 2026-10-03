@@ -3009,7 +3009,7 @@ audit_dns_hosts() {
     echo -e "\n${YELLOW}--- /etc/hosts Non-Standard Entries Check ---${NC}"
     if [[ -f "/etc/hosts" ]]; then
         local custom_hosts
-        custom_hosts=$(grep -vE '^\s*#|localhost|127\.0\.0\.1|::1|fe00::0|ff02::' /etc/hosts | grep -v '^\s*$')
+        custom_hosts=$(grep -vE '^\s*#|localhost|127\.0\.0\.1|127\.0\.1\.1|::1|fe00::0|ff02::' /etc/hosts | grep -v '^\s*$')
         if [[ -n "$custom_hosts" ]]; then
             echo -e "${CYAN}Custom /etc/hosts entries:${NC}"
             echo "$custom_hosts"
@@ -3059,8 +3059,7 @@ audit_connected_devices() {
         block_devs=$(lsblk -o NAME,SIZE,TYPE,TRAN,RM,MOUNTPOINT,RO 2>/dev/null)
         if [[ -n "$block_devs" ]]; then
             echo "$block_devs" | sed 's/^/  /'
-            
-            # Check for mounted removable media (USB drives, SD cards)
+
             local removable_mounts
             removable_mounts=$(lsblk -rn -o NAME,TRAN,RM,MOUNTPOINT 2>/dev/null | awk '$3 == "1" || $2 == "usb" {if ($4 != "") print $1, $4}')
             if [[ -n "$removable_mounts" ]]; then
@@ -3108,7 +3107,9 @@ audit_connected_devices() {
             if [[ "$bt_disc" == "yes" ]]; then
                 log_warn "Bluetooth adapter is DISCOVERABLE to nearby un-paired devices!"
             else
-                log_pass "Bluetooth adapter is non-discoverable."
+                log_pass "Bluetooth adapter is non-discoverable."⚠️ CRITICAL: POTENTIAL SUSPICIOUS USB DEVICE DETECTED:
+Bus 003 Device 002: ID 046a:c131 CHERRY CHERRY Wireless Device
+
             fi
         else
             echo "Bluetooth controller inactive or not present."
