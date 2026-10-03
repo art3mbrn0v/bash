@@ -422,6 +422,8 @@ check_ssh_keys_passphrase() {
         log_pass "All discovered SSH private keys (${total_keys_found}) are protected with passphrases."
     fi
 }
+check_ssh_keys_passphrase
+
 audit_ssh_keys_age_and_cert_expiration() {
     echo -e "\n${YELLOW}--- Auditing SSH Key Creation Age & SSL/TLS Certificate Expirations ---${NC}"
 
@@ -2074,9 +2076,10 @@ PYEOF
     fi
 }
 
+# 10. User Accounts, Privileges, Passwords & System Auth Files Audit
+section "10/20" "Auditing User Accounts, Privileges, Passwords & System Auth Files..."
 audit_passwd_group_shadow
 
-# 11. Repository Kernel & Security Package Updates Audit
 # 11. Package Manager & Repository Audit
 section "11/20" "Auditing Package Repositories, Kernel Updates & Recommended Packages..."
 
@@ -3034,9 +3037,9 @@ audit_connected_devices() {
             usb_count=$(echo "$usb_devices" | wc -l)
             log_pass "Discovered ${usb_count} connected USB device(s)."
 
-            # Detect potential suspicious USB HID / Wireless / Storage dongles
+            # Detect potential suspicious USB HID attack tools & sniffing hardware
             local suspicious_usb
-            suspicious_usb=$(echo "$usb_devices" | grep -Ei "rubber|ducky|badusb|keysmith|keystroke|wireless|sniffer")
+            suspicious_usb=$(echo "$usb_devices" | grep -Ei "rubber|ducky|badusb|keysmith|keystroke|wireless[ _]?sniffer|packet[ _]?sniffer|wifi[ _]?pineapple|lan[ _]?turtle|bash[ _]?bunny|pwnagotchi")
             if [[ -n "$suspicious_usb" ]]; then
                 log_crit "POTENTIAL SUSPICIOUS USB DEVICE DETECTED:\n$suspicious_usb"
             fi
