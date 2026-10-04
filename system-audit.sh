@@ -3,20 +3,26 @@
 # System Security & Optimization Audit (Debian / Ubuntu / Fedora family)
 #
 # Usage: sudo ./system-audit.sh [options]
-#   (no options)         read-only audit: nothing on the system is modified
+#   (no options)         audit/report mode; no system remediation is performed
 #   --fix                apply safe permission/config remediations
 #   --install            install missing scanner packages (apt/dnf)
 #   --restart-services   restart services reported by needrestart / failed units
+#   --update-db          refresh APT/ClamAV/Trivy security databases
 #   --clean-cache        delete reclaimable user caches (thumbnails, pip, npm ...)
 #   --clean-history      remove lines with secrets from shell history (backup kept)
-#   --no-dict            do not download / refresh the weak-password dictionary
+#   --no-dict            disable the weak-password dictionary check
+#   --refresh-dict       refresh the external weak-password dictionary cache
 #   --report-dir DIR     where to write the report (default: ./reports)
 #   -h, --help           show this help
 # Exit code: 0 = no critical findings, 1 = critical findings, 2 = usage error
 # ==============================================================================
 
 # Locale-independent parsing of tool output (ss, lastlog, passwd -S, ...)
-export LC_ALL=C.UTF-8
+export LC_ALL=C
+umask 077
+set -o pipefail
+
+VERSION="2.0-refactored"
 
 # Script directory resolution
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,21 +43,32 @@ CLEAN_HISTORY=false
 GENERATE_REPORT=true
 AUTO_RESTART_SERVICES=false
 INSTALL_MISSING_PKGS=false
+UPDATE_SECURITY_DATABASES=false
 FETCH_EXTERNAL_PASSWORDS=true
+REFRESH_EXTERNAL_PASSWORDS=false
 REPORT_DIR="${SCRIPT_DIR}/reports"
 TRIVY_MISSING=false
 
-usage() { sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fix)              AUTO_FIX=true ;;
         --install)          INSTALL_MISSING_PKGS=true ;;
         --restart-services) AUTO_RESTART_SERVICES=true ;;
+        --update-db)        UPDATE_SECURITY_DATABASES=true ;;
         --clean-cache)      CLEAN_CACHE=true ;;
         --clean-history)    CLEAN_HISTORY=true ;;
         --no-dict)          FETCH_EXTERNAL_PASSWORDS=false ;;
-        --report-dir)       shift; REPORT_DIR="${1:?--report-dir needs a path}" ;;
+        --refresh-dict)     REFRESH_EXTERNAL_PASSWORDS=true ;;
+        --report-dir)
+            if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+                echo "Error: --report-dir requires a non-option path." >&2
+                exit 2
+            fi
+            REPORT_DIR="$2"
+            shift
+            ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -83,6 +100,16 @@ fetch_external_password_lists() {
     echo -e "${YELLOW}--- Weak Password Dictionary Cache (GitHub sources) ---${NC}"
     mkdir -p "$DICT_CACHE_DIR" 2>/dev/null
     chmod 700 "$DICT_CACHE_DIR" 2>/dev/null
+
+    # Do not touch the network/cache unless explicitly requested.
+    if [[ "$REFRESH_EXTERNAL_PASSWORDS" != true ]]; then
+        if [[ -s "$DICT_FILE" ]]; then
+            echo -e "  ${CYAN}Using existing cached dictionary; refresh only with --refresh-dict.${NC}"
+        else
+            echo -e "  ${YELLOW}No cached dictionary found; refresh only with --refresh-dict.${NC}"
+        fi
+        return 0
+    fi
 
     # Choose an available download tool
     local fetch_cmd=""
@@ -200,7 +227,6 @@ touch "$REPORT_FILE" && chmod 600 "$REPORT_FILE" 2>/dev/null || true
 # Let the invoking user read the report without sudo
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     chown "$SUDO_USER": "$REPORT_FILE" 2>/dev/null || true
-    [[ "$(stat -c %U "$REPORT_DIR" 2>/dev/null)" == "root" ]] && chown "$SUDO_USER": "$REPORT_DIR" 2>/dev/null || true
 fi
 
 # Private scratch directory: the ONLY place this script creates temp files.
@@ -211,6 +237,7 @@ exec > >(tee >(sed -r 's/\x1B\[[0-9;]*[mK]//g' > "$REPORT_FILE")) 2>&1
 echo -e "${CYAN}=====================================================${NC}"
 echo -e "${CYAN}=== Starting System Security & Optimization Audit ===${NC}"
 echo -e "${CYAN}=====================================================${NC}"
+echo -e "Audit Version    : ${CYAN}${VERSION}${NC}"
 echo -e "Audit Started At : ${CYAN}${AUDIT_START_TIME_STR}${NC}"
 
 # --- Helper Functions & Tool Resolution ---
@@ -491,7 +518,7 @@ check_all_dependencies
 # Apply automatic security fixes and permission hardening
 if [[ "$AUTO_FIX" == true ]]; then
     echo -e "${YELLOW}=== Running in Auto-Fix Mode (--fix enabled) ===${NC}"
-    # Harden ~/.ssh for root and for every real user home (not just $HOME of the invoking user)
+    # Harden ~/.ssh for root and real user homes only in explicit --fix mode.
     while IFS=: read -r u_name u_pass u_uid u_gid u_gecos u_home u_shell; do
         [[ -d "$u_home/.ssh" ]] || continue
         if [[ "$u_uid" -eq 0 || "$u_uid" -ge 1000 ]]; then
@@ -544,7 +571,11 @@ update_security_databases() {
     echo ""
 }
 
-update_security_databases
+if [[ "$UPDATE_SECURITY_DATABASES" == true ]]; then
+    update_security_databases
+else
+    log_info "Security database refresh skipped (report-only). Use --update-db to refresh APT/ClamAV/Trivy databases."
+fi
 
 # 1. Shell History Scanning & Cleaning
 section "1/24" "Cleaning Shell History for Sensitive Data..."
@@ -604,20 +635,26 @@ fi
 
 # 2. Certificate & File Permission Checks
 section "2/24" "Checking Minikube & SSH Certificate Permissions..."
-MINIKUBE_DIR="$HOME/.minikube"
-if [[ -d "$MINIKUBE_DIR" ]]; then
-    CERT_FILES=$(find "$MINIKUBE_DIR" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
+while IFS=: read -r m_user _ m_uid _ _ m_home _; do
+    [[ -d "$m_home" ]] || continue
+    [[ "$m_uid" -eq 0 || "$m_uid" -ge 1000 ]] || continue
+
+    local_minikube="$m_home/.minikube"
+    [[ -d "$local_minikube" ]] || continue
+
+    CERT_FILES=$(find "$local_minikube" -name "*.pem" -perm /o+rwx,g+rwx 2>/dev/null)
     if [[ -n "$CERT_FILES" ]]; then
-        log_warn "Found minikube files with insecure permissions:\n$CERT_FILES"
-        echo "Fixing permissions to 600..."
-        find "$MINIKUBE_DIR" -name "*.pem" -exec chmod 600 {} + 2>/dev/null
-        log_pass "Minikube permissions fixed."
+        log_warn "User '${m_user}': insecure Minikube PEM permissions:\n$CERT_FILES"
+        if [[ "$AUTO_FIX" == true ]]; then
+            find "$local_minikube" -name "*.pem" -exec chmod 600 {} + 2>/dev/null
+            log_pass "User '${m_user}': Minikube PEM permissions fixed."
+        else
+            log_info "User '${m_user}': Minikube files were not changed (report-only mode). Use --fix to remediate."
+        fi
     else
-        log_pass "Minikube certificate permissions are secure."
+        log_pass "User '${m_user}': Minikube certificate permissions are secure."
     fi
-else
-    echo "Minikube directory not found."
-fi
+done < /etc/passwd
 
 echo -e "\n${YELLOW}--- Auditing SSH Private Keys & Passphrase Protection (All Users) ---${NC}"
 check_ssh_keys_passphrase() {
@@ -627,13 +664,13 @@ check_ssh_keys_passphrase() {
     while IFS=: read -r username password uid gid gecos home shell; do
         local ssh_dir="$home/.ssh"
         if [[ -d "$ssh_dir" ]]; then
-            chmod 700 "$ssh_dir" 2>/dev/null
+            [[ "$AUTO_FIX" == true ]] && chmod 700 "$ssh_dir" 2>/dev/null
             
             while read -r key_file; do
                 [[ -f "$key_file" ]] || continue
                 
                 if grep -q "PRIVATE KEY" "$key_file" 2>/dev/null; then
-                    chmod 600 "$key_file" 2>/dev/null
+                    [[ "$AUTO_FIX" == true ]] && chmod 600 "$key_file" 2>/dev/null
                     ((total_keys_found++))
                     
                     if [[ "${TOOL_FOUND['ssh-keygen']}" -eq 1 ]] && "${TOOL_BIN['ssh-keygen']}" -y -P "" -f "$key_file" &>/dev/null; then
@@ -765,18 +802,47 @@ audit_ssh_keys_age_and_cert_expiration() {
 }
 
 audit_ssh_keys_age_and_cert_expiration
+# Package-manager query caches. Expensive repository queries are executed at most once per run.
+APT_UPGRADABLE_CACHE=""
+APT_UPGRADABLE_LOADED=false
+DNF_SECURITY_CACHE=""
+DNF_SECURITY_LOADED=false
+DNF_UPDATES_CACHE=""
+DNF_UPDATES_LOADED=false
+get_apt_upgradable() {
+    if [[ "$APT_UPGRADABLE_LOADED" != true && "${TOOL_FOUND[apt-get]:-0}" -eq 1 && "${TOOL_FOUND[apt]:-0}" -eq 1 ]]; then
+        APT_UPGRADABLE_CACHE=$(apt list --upgradable 2>/dev/null || true)
+        APT_UPGRADABLE_LOADED=true
+    fi
+    printf '%s\n' "$APT_UPGRADABLE_CACHE"
+}
+get_dnf_security_installed() {
+    if [[ "$DNF_SECURITY_LOADED" != true && "${TOOL_FOUND[dnf]:-0}" -eq 1 ]]; then
+        DNF_SECURITY_CACHE=$(dnf -q updateinfo list security --installed 2>/dev/null || true)
+        DNF_SECURITY_LOADED=true
+    fi
+    printf '%s\n' "$DNF_SECURITY_CACHE"
+}
+get_dnf_check_update() {
+    if [[ "$DNF_UPDATES_LOADED" != true && "${TOOL_FOUND[dnf]:-0}" -eq 1 ]]; then
+        DNF_UPDATES_CACHE=$(dnf -q check-update 2>/dev/null || true)
+        DNF_UPDATES_LOADED=true
+    fi
+    printf '%s\n' "$DNF_UPDATES_CACHE"
+}
+
 # 3. Application CVE Checks
-section "3/24" "Checking Installed Applications for Security Vulnerabilities (CVEs)..."
+section "3/24" "Checking Installed Applications for Available Security Updates..."
 APPS_TO_CHECK=("code" "google-chrome-stable" "firefox" "docker-cli" "kubernetes1.34-client" "clamav")
 if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     for app in "${APPS_TO_CHECK[@]}"; do
         if rpm -q "$app" &> /dev/null; then
             echo -n "Checking $app... "
-            SECURITY_INFO=$(dnf updateinfo list security --installed "$app" 2>/dev/null | grep "$app")
+            SECURITY_INFO=$(get_dnf_security_installed | grep -F -- "$app")
             if [[ -n "$SECURITY_INFO" ]]; then
                 log_crit "VULNERABILITY FOUND IN $app:\n$SECURITY_INFO"
             else
-                log_pass "Application $app has no known unpatched security alerts in repo."
+                log_pass "No installed security advisory was reported by DNF for $app."
             fi
         fi
     done
@@ -784,9 +850,9 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     for app in "${APPS_TO_CHECK[@]}"; do
         if dpkg-query -W -f='${Status}' "$app" 2>/dev/null | grep -q "ok installed"; then
             echo -n "Checking $app... "
-            SECURITY_INFO=$(apt list --upgradable 2>/dev/null | grep -i "$app")
+            SECURITY_INFO=$(get_apt_upgradable | grep -iF -- "$app")
             if [[ -n "$SECURITY_INFO" ]]; then
-                log_warn "Update / security patch available for $app:\n$SECURITY_INFO"
+                log_warn "An update is available for $app:\n$SECURITY_INFO"
             else
                 log_pass "Application $app is up to date."
             fi
@@ -923,7 +989,7 @@ audit_ssh_daemon_config() {
         if [[ -n "$found_weak_ciphers" ]]; then
             log_crit "Weak / Obsolete SSH Ciphers enabled: ${found_weak_ciphers}! Recommended: chacha20-poly1305@openssh.com, aes256-gcm@openssh.com, aes128-gcm@openssh.com."
         else
-            log_pass "SSH Cipher suite configuration verified (only strong AEAD/GCM ciphers configured)."
+            log_pass "No explicitly blacklisted legacy SSH ciphers detected in the effective configuration."
         fi
     fi
 
@@ -945,7 +1011,7 @@ audit_ssh_daemon_config() {
         local found_weak_kex
         found_weak_kex=$(echo "$kex_val" | grep -Ei "$weak_kex_pattern")
         if [[ -n "$found_weak_kex" ]]; then
-            log_warn "Weak / Obsolete SSH Key Exchange (KEX) algorithms enabled: ${found_weak_kex}! Recommended: curve25519-dalek@coderberg.org, curve25519-sha256, diffie-hellman-group16-sha512."
+            log_warn "Weak / Obsolete SSH Key Exchange (KEX) algorithms enabled: ${found_weak_kex}! Recommended modern KEX: curve25519-sha256 / curve25519-sha256@libssh.org and group16+ SHA-2 variants."
         else
             log_pass "SSH Key Exchange (KEX) algorithms verified."
         fi
@@ -1015,8 +1081,13 @@ audit_network_security_and_tunnels() {
             rule_count=$(echo "$ipt_rules" | grep -c -E '^[[:space:]]*[0-9]+')
             echo -e "  iptables IPv4 INPUT Policy : ${CYAN}${input_pol:-UNKNOWN}${NC} (${rule_count} active filtering rules)"
 
-            if [[ "$rule_count" -gt 0 || "$input_pol" == "(policy DROP)" || "$input_pol" == "(policy REJECT)" ]]; then
+            if [[ "$input_pol" == "(policy DROP)" || "$input_pol" == "(policy REJECT)" ]]; then
                 firewall_active=true
+            elif [[ "$rule_count" -gt 0 ]]; then
+                # Rules may exist while the default INPUT policy is ACCEPT. Treat this as configured,
+                # but do not claim that the host is fully protected by a filtering firewall.
+                firewall_active=true
+                log_warn "iptables has ${rule_count} rule(s), but INPUT policy is ${input_pol:-UNKNOWN}; verify that the rules actually restrict unwanted inbound traffic."
             fi
         fi
     fi
@@ -1945,7 +2016,7 @@ audit_and_clean_user_cache() {
                 echo -e "  - ${item}"
             done
             log_warn "User home directories contain ${total_human} of temporary cache files."
-            echo -e "  ${YELLOW}Tip: Run script with '--fix' or '--clean-cache' to automatically purge these caches.${NC}"
+            echo -e "  ${YELLOW}Tip: Run the script with '--clean-cache' to automatically purge these caches.${NC}"
         fi
     else
         log_pass "User home directories have no accumulated temporary caches (> 1MB)."
@@ -2814,7 +2885,7 @@ if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     echo -e "Detected package manager: ${BLUE}dnf${NC} (RedHat/Fedora family)"
 
     echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
-    KERNEL_UPDATES=$(dnf check-update kernel kernel-core kernel-modules 2>/dev/null | grep -E '^kernel(-core|-modules)?\.')
+    KERNEL_UPDATES=$(get_dnf_check_update | grep -E '^kernel(-core|-modules)?\.')
     if [[ -n "$KERNEL_UPDATES" ]]; then
         log_warn "New kernel update available in repository:\n$KERNEL_UPDATES"
     else
@@ -2833,7 +2904,7 @@ if [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
     RECOMMENDED_PKGS=("fail2ban" "firewalld" "audit" "clamav" "chkrootkit" "trivy" "policycoreutils" "crypto-policies")
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if rpm -q "$pkg" &> /dev/null; then
-            PKG_UPDATE=$(dnf check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\.")
+            PKG_UPDATE=$(get_dnf_check_update | grep -E "^${pkg}\.")
             if [[ -n "$PKG_UPDATE" ]]; then
                 echo -e "  - $pkg: ${GREEN}Installed${NC} | ${RED}Update Available in Repo${NC}"
             else
@@ -2848,7 +2919,7 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     echo -e "Detected package manager: ${BLUE}apt${NC} (Debian family)"
 
     echo -e "\n${YELLOW}--- Checking Kernel Updates in Repository ---${NC}"
-    KERNEL_UPDATES=$(apt list --upgradable 2>/dev/null | grep -E '^linux-(image|headers|generic|amd64|arm64)')
+    KERNEL_UPDATES=$(get_apt_upgradable | grep -E '^linux-(image|headers|generic|amd64|arm64)')
     if [[ -n "$KERNEL_UPDATES" ]]; then
         log_warn "New kernel update available in repository:\n$KERNEL_UPDATES"
     else
@@ -2867,7 +2938,7 @@ elif [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
     RECOMMENDED_PKGS=("ufw" "auditd" "apparmor" "unattended-upgrades" "clamav" "chkrootkit" "needrestart" "debsums" "lynis")
     # fail2ban only makes sense when an SSH daemon is installed
     [[ -f /etc/ssh/sshd_config ]] && RECOMMENDED_PKGS+=("fail2ban")
-    UPGRADABLE_LIST=$(apt list --upgradable 2>/dev/null)
+    UPGRADABLE_LIST=$(get_apt_upgradable)
     for pkg in "${RECOMMENDED_PKGS[@]}"; do
         if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"; then
             PKG_UPDATE=$(grep -E "^${pkg}/" <<< "$UPGRADABLE_LIST")
@@ -2959,7 +3030,7 @@ audit_pinned_packages() {
 
                 local inst_ver cand_ver
                 inst_ver=$(rpm -q --queryformat '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null)
-                cand_ver=$(dnf check-update "$pkg" 2>/dev/null | grep -E "^${pkg}\." | awk '{print $2}')
+                cand_ver=$(get_dnf_check_update | grep -E "^${pkg}\." | awk '{print $2}')
 
                 [[ -z "$inst_ver" ]] && inst_ver="Not Installed"
                 [[ -z "$cand_ver" ]] && cand_ver="$inst_ver (Up-to-date)"
@@ -3807,7 +3878,7 @@ audit_kernel_hardening() {
     # A pending kernel security update strongly implies unpatched known CVEs in the running kernel.
     local kernel_update_pending=""
     if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
-        kernel_update_pending=$(apt list --upgradable 2>/dev/null | grep -E '^linux-(image|kernel|firmware)' | head -n 5)
+        kernel_update_pending=$(get_apt_upgradable | grep -E '^linux-(image|kernel|firmware)' | head -n 5)
     elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
         kernel_update_pending=$(dnf -q updateinfo list security --installed 2>/dev/null | grep -iE 'kernel' | head -n 5)
     fi
@@ -4196,7 +4267,7 @@ audit_pending_updates() {
     local total_updates=0 security_updates=0
 
     if [[ "${TOOL_FOUND['apt-get']}" -eq 1 ]]; then
-        total_updates=$(apt list --upgradable 2>/dev/null | grep -c '^' 2>/dev/null)
+        total_updates=$(get_apt_upgradable | grep -c '^' 2>/dev/null)
         # subtract the "Listing..." header line
         [[ "$total_updates" -gt 0 ]] && total_updates=$((total_updates - 1))
         [[ "$total_updates" -lt 0 ]] && total_updates=0
@@ -4204,8 +4275,8 @@ audit_pending_updates() {
         echo -e "  Total packages awaiting update : ${CYAN}${total_updates}${NC}"
         echo -e "  Security updates pending        : ${CYAN}${security_updates}${NC}"
     elif [[ "${TOOL_FOUND['dnf']}" -eq 1 ]]; then
-        total_updates=$(dnf -q check-update 2>/dev/null | grep -cE '^[a-zA-Z0-9]' || true)
-        security_updates=$(dnf -q updateinfo list security --installed 2>/dev/null | grep -cE '^[a-zA-Z0-9]' || true)
+        total_updates=$(get_dnf_check_update | grep -cE '^[a-zA-Z0-9]' || true)
+        security_updates=$(get_dnf_security_installed | grep -cE '^[a-zA-Z0-9]' || true)
         echo -e "  Total packages awaiting update : ${CYAN}${total_updates}${NC}"
         echo -e "  Security updates pending        : ${CYAN}${security_updates}${NC}"
     else
@@ -4693,7 +4764,7 @@ print_scorecard() {
 
     echo -e "${CYAN}=====================================================${NC}"
     local mode="report-only (no changes made)"
-    [[ "$AUTO_FIX" == true || "$INSTALL_MISSING_PKGS" == true || "$CLEAN_CACHE" == true || "$CLEAN_HISTORY" == true || "$AUTO_RESTART_SERVICES" == true ]] && mode="changes enabled via flags"
+    [[ "$AUTO_FIX" == true || "$INSTALL_MISSING_PKGS" == true || "$UPDATE_SECURITY_DATABASES" == true || "$CLEAN_CACHE" == true || "$CLEAN_HISTORY" == true || "$AUTO_RESTART_SERVICES" == true || "$REFRESH_EXTERNAL_PASSWORDS" == true ]] && mode="changes enabled via flags"
     echo -e "${GREEN}[OK] System audit finished - mode: ${mode}.${NC}"
     echo -e "  Detailed Markdown Report Log: ${CYAN}${REPORT_FILE}${NC}"
     echo -e "${CYAN}=====================================================${NC}"
@@ -4701,6 +4772,5 @@ print_scorecard() {
 
 print_scorecard
 
-sleep 1   # let the tee/sed report pipeline flush before exiting
 [[ $CRITICAL_COUNT -gt 0 ]] && exit 1
 exit 0
