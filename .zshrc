@@ -1,169 +1,154 @@
-# If you come from bash you might have to change your $PATH.
-# export PATH=$HOME/bin:$HOME/.local/bin:/usr/local/bin:$PATH
+# ~/.zshrc — interactive zsh on Oh My Zsh.
+# PATH for cargo is set in ~/.zshenv, for ~/.local/bin in ~/.local/bin/env.
 
-# Path to your Oh My Zsh installation.
+# ---- Oh My Zsh ---------------------------------------------------------------
 export ZSH="$HOME/.oh-my-zsh"
-
-# Set name of the theme to load --- if set to "random", it will
-# load a random theme each time Oh My Zsh is loaded, in which case,
-# to know which specific one was loaded, run: echo $RANDOM_THEME
-# See https://github.com/ohmyzsh/ohmyzsh/wiki/Themes
-# ZSH_THEME="robbyrussell"
 ZSH_THEME="agnoster" # set by `omz`
-# ZSH_THEME="bira"
 
-# Set list of themes to pick from when loading at random
-# Setting this variable when ZSH_THEME=random will cause zsh to load
-# a theme from this variable instead of looking in $ZSH/themes/
-# If set to an empty array, this variable will have no effect.
-# ZSH_THEME_RANDOM_CANDIDATES=( "robbyrussell" "agnoster" )
-
-# Uncomment the following line to use case-sensitive completion.
-# CASE_SENSITIVE="true"
-
-# Uncomment the following line to use hyphen-insensitive completion.
-# Case-sensitive completion must be off. _ and - will be interchangeable.
-# HYPHEN_INSENSITIVE="true"
-
-# Uncomment one of the following lines to change the auto-update behavior
-# zstyle ':omz:update' mode disabled  # disable automatic updates
-# zstyle ':omz:update' mode auto      # update automatically without asking
-# zstyle ':omz:update' mode reminder  # just remind me to update when it's time
-
-# Uncomment the following line to change how often to auto-update (in days).
+zstyle ':omz:update' mode reminder   # remind about updates instead of prompting at startup
 zstyle ':omz:update' frequency 7
 
-# Uncomment the following line if pasting URLs and other text is messed up.
-# DISABLE_MAGIC_FUNCTIONS="true"
-
-# Uncomment the following line to disable colors in ls.
-# DISABLE_LS_COLORS="true"
-
-# Uncomment the following line to disable auto-setting terminal title.
-# DISABLE_AUTO_TITLE="true"
-
-# Uncomment the following line to enable command auto-correction.
-# ENABLE_CORRECTION="true"
-
-# Uncomment the following line to display red dots whilst waiting for completion.
-# You can also set it to another string to have that shown instead of the default red dots.
-# e.g. COMPLETION_WAITING_DOTS="%F{yellow}waiting...%f"
-# Caution: this setting can cause issues with multiline prompts in zsh < 5.7.1 (see #5765)
-# COMPLETION_WAITING_DOTS="true"
-
-# Uncomment the following line if you want to disable marking untracked files
-# under VCS as dirty. This makes repository status check for large repositories
-# much, much faster.
-# DISABLE_UNTRACKED_FILES_DIRTY="true"
-
-# Uncomment the following line if you want to change the command execution time
-# stamp shown in the history command output.
-# You can set one of the optional three formats:
-# "mm/dd/yyyy"|"dd.mm.yyyy"|"yyyy-mm-dd"
-# or set a custom format using the strftime function format specifications,
-# see 'man strftime' for details.
-# HIST_STAMPS="mm/dd/yyyy"
-
-# Would you like to use another custom folder than $ZSH/custom?
-# ZSH_CUSTOM=/path/to/new-custom-folder
-
-# Which plugins would you like to load?
-# Standard plugins can be found in $ZSH/plugins/
-# Custom plugins may be added to $ZSH_CUSTOM/plugins/
-# Example format: plugins=(rails git textmate ruby lighthouse)
-# Add wisely, as too many plugins slow down shell startup.
-# plugins=(git)
+# zsh-syntax-highlighting must be the last plugin.
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
 
-source $ZSH/oh-my-zsh.sh
+source "$ZSH/oh-my-zsh.sh"
 
-# User configuration
-
-# export MANPATH="/usr/local/man:$MANPATH"
-
-# You may need to manually set your language environment
-# export LANG=en_US.UTF-8
-
-# Preferred editor for local and remote sessions
-# if [[ -n $SSH_CONNECTION ]]; then
-#   export EDITOR='vim'
-# else
-#   export EDITOR='nvim'
-# fi
-
-# Compilation flags
-# export ARCHFLAGS="-arch $(uname -m)"
-
-# Set personal aliases, overriding those provided by Oh My Zsh libs,
-# plugins, and themes. Aliases can be placed here, though Oh My Zsh
-# users are encouraged to define aliases within a top-level file in
-# the $ZSH_CUSTOM folder, with .zsh extension. Examples:
-# - $ZSH_CUSTOM/aliases.zsh
-# - $ZSH_CUSTOM/macos.zsh
-# For a full list of active aliases, run `alias`.
-#
-# Example aliases
-# alias zshconfig="mate ~/.zshrc"
-# alias ohmyzsh="mate ~/.oh-my-zsh"
-
-# gemini-cli
-export GEMINI_API_KEY=""
-
-export PATH="$HOME/.npm-global/bin:/usr/local/share/npm/bin:$PATH"
-
+# ---- Environment -------------------------------------------------------------
 . "$HOME/.local/bin/env"
-export PATH="/home/artem/.local/bin:$PATH"
+typeset -U path PATH   # drop duplicate PATH entries
 
-export HISTSIZE=999999
-export SAVEHIST=999999
-setopt EXTENDED_HISTORY
-setopt SHARE_HISTORY
-setopt HIST_IGNORE_SPACE
+export EDITOR=vim
+export VISUAL=vim
+
+# ---- History -----------------------------------------------------------------
+HISTSIZE=999999
+SAVEHIST=999999
+setopt EXTENDED_HISTORY       # timestamp and duration of each command
+setopt SHARE_HISTORY          # history shared between open terminals
+setopt HIST_IGNORE_SPACE      # commands starting with a space are not saved
 setopt HIST_REDUCE_BLANKS
+setopt HIST_IGNORE_DUPS       # skip consecutive duplicates
+setopt HIST_FIND_NO_DUPS      # hide duplicates when searching (Ctrl+R, arrows)
+setopt HIST_EXPIRE_DUPS_FIRST
+setopt HIST_VERIFY            # expand !! and !$ before running
 
-
-sysupdate() {
-        # Цвета для красивого вывода
-        local GREEN='\033[0;32m'
-        local BLUE='\033[0;34m'
-        local NC='\033[0m' # Reset color
-
-        echo -e "${BLUE}===> Start sudo-session...${NC}"
-        sudo -v || return 1
-
-        echo -e "${GREEN}---- 1. APT Update & Full-Upgrade ----${NC}"
-        sudo apt update && sudo apt list --upgradable && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo apt autoclean || return 1
-
-	echo -e "${GREEN}----"
-        # echo -e "${GREEN}---- 2. Flatpak Update & Cleanup ----${NC}"
-        # flatpak update -y && flatpak uninstall --unused -y
-
-        echo -e "${GREEN}---- 3. AGY Update ----${NC}"
-        agy update
-	echo -e "${GREEN}----"
-
-	echo -e "${GREEN}---- 3. Claude Update ----${NC}"
-        claude --update
-	echo -e "${GREEN}----"
-
-        echo -e "${GREEN}---- 4. ClamAV Update ----${NC}"
-        sudo systemctl stop clamav-freshclam
-	sleep 5
-        sudo freshclam
-        sudo systemctl start clamav-freshclam
-	echo -e "${GREEN}----"
-
-        echo -e "${GREEN}---- 5. Rust Update ----${NC}"
-        rustup update
-	echo -e "${GREEN}----"
-
-        echo -e "${GREEN}---- 6. UpdateDB ----${NC}"
-        sudo updatedb
-	echo -e "${GREEN}----"
-
-        echo -e "${BLUE}=== Done ===${NC}"
-    }
-
+# ---- Aliases -----------------------------------------------------------------
 alias rm='rm -i'
 alias cp='cp -i'
 alias mv='mv -i'
+
+# ---- Functions ---------------------------------------------------------------
+
+# Update the whole system: apt, Claude Code, ClamAV databases, Rust, locate database.
+# An apt failure aborts the run; failures of other steps are listed at the end.
+sysupdate() {
+    emulate -L zsh
+    zmodload zsh/datetime
+
+    local -a failed summary
+    local -i n=0 total=5
+    local t_all=$EPOCHREALTIME t_step
+
+    # 75 → "1m 15s", 9 → "9s"
+    _su_dur() {
+        local -i s=$1
+        (( s >= 60 )) && print -n "$((s / 60))m $((s % 60))s" || print -n "${s}s"
+    }
+    _su_begin() {
+        t_step=$EPOCHREALTIME
+        print -P "%F{cyan}│%f\n%F{cyan}├─▶%f %B[$((++n))/$total] $1%b"
+    }
+    # $1 — step name, $2 — exit code
+    _su_end() {
+        local d=$(_su_dur $(( EPOCHREALTIME - t_step )))
+        if (( $2 == 0 )); then
+            summary+=("%F{green}✓%f $1 %F{242}$d%f")
+            print -P "%F{cyan}│%f   %F{green}✓ done%f %F{242}in $d%f"
+        else
+            failed+=($1)
+            summary+=("%F{red}✗%f $1 %F{242}$d%f")
+            print -P "%F{cyan}│%f   %F{red}✗ failed, exit code $2%f %F{242}in $d%f"
+        fi
+    }
+    _su_finish() {
+        local d=$(_su_dur $(( EPOCHREALTIME - t_all )))
+        print -P "%F{cyan}│%f"
+        print -P "%F{cyan}╰─%f %BSummary%b %F{242}in $d%f"
+        local line
+        for line in $summary; do print -P "   $line"; done
+        if (( ${#failed} )); then
+            print -P "   %F{red}%BFailed:%b ${(j:, :)failed}%f"
+        fi
+        [[ -f /run/reboot-required ]] && print -P "   %F{yellow}⚠ Reboot required%f"
+        if (( $+commands[notify-send] )); then
+            if (( ${#failed} )); then
+                notify-send -i dialog-warning "sysupdate" "Failed: ${(j:, :)failed}"
+            else
+                notify-send -i emblem-ok-symbolic "sysupdate" "System updated in $d"
+            fi
+        fi
+    }
+
+    {
+        print -P "%F{cyan}╭─%f %B%F{blue}System update%f%b %F{242}$(strftime '%Y-%m-%d %H:%M' $EPOCHSECONDS)%f"
+        sudo -v || return 1
+
+        _su_begin "APT"
+        sudo apt update && apt list --upgradable 2>/dev/null | tail -n +2 \
+            && sudo apt full-upgrade -y && sudo apt autoremove -y && sudo apt autoclean
+        _su_end APT $?
+        if (( ${#failed} )); then
+            print -P "%F{cyan}│%f   %F{red}APT failed, stopping here.%f"
+            _su_finish
+            return 1
+        fi
+
+        _su_begin "Claude Code"
+        claude update
+        _su_end Claude $?
+
+        _su_begin "ClamAV"
+        # freshclam won't run while the service holds the database lock.
+        local -i rc=0
+        if sudo systemctl stop clamav-freshclam; then
+            sudo freshclam || rc=$?
+        else
+            rc=1
+        fi
+        sudo systemctl start clamav-freshclam || rc=1
+        _su_end ClamAV $rc
+
+        _su_begin "Rust"
+        rustup update
+        _su_end Rust $?
+
+        _su_begin "UpdateDB"
+        sudo updatedb
+        _su_end UpdateDB $?
+
+        _su_finish
+        return $(( ${#failed} > 0 ))
+    } always {
+        unfunction _su_dur _su_begin _su_end _su_finish
+    }
+}
+
+# Battery conservation mode (Lenovo IdeaPad): charging stops at ~60%.
+# Usage: batcons [on|off] — without an argument shows the current state.
+batcons() {
+    local f=/sys/bus/platform/drivers/ideapad_acpi/VPC2004:00/conservation_mode
+    local bat=(/sys/class/power_supply/BAT*(N[1]))
+    [[ -r $f ]] || { print -P "%F{red}conservation_mode not available%f"; return 1; }
+    case $1 in
+        on)  print 1 | sudo tee $f >/dev/null || return ;;
+        off) print 0 | sudo tee $f >/dev/null || return ;;
+        '')  ;;
+        *)   print "usage: batcons [on|off]"; return 2 ;;
+    esac
+    if (( $(<$f) )); then
+        print -P "Conservation mode: %F{green}on%f (charging stops at ~60%%)"
+    else
+        print -P "Conservation mode: %F{yellow}off%f (charging to 100%%)"
+    fi
+    [[ -n $bat && -r $bat/capacity ]] && print "Battery: $(<$bat/capacity)% ($(<$bat/status))"
+}
