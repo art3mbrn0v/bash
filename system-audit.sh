@@ -1077,11 +1077,11 @@ audit_network_security_and_tunnels() {
         ipt_rules=$(run_sudo iptables -L -n -v 2>/dev/null)
         if [[ -n "$ipt_rules" ]]; then
             local input_pol rule_count
-            input_pol=$(echo "$ipt_rules" | grep -E "^Chain INPUT" | awk '{print $4}')
+            input_pol=$(echo "$ipt_rules" | grep -E "^Chain INPUT" | grep -oE 'policy [A-Z]+' | awk '{print $2}')
             rule_count=$(echo "$ipt_rules" | grep -c -E '^[[:space:]]*[0-9]+')
             echo -e "  iptables IPv4 INPUT Policy : ${CYAN}${input_pol:-UNKNOWN}${NC} (${rule_count} active filtering rules)"
 
-            if [[ "$input_pol" == "(policy DROP)" || "$input_pol" == "(policy REJECT)" ]]; then
+            if [[ "$input_pol" == "DROP" || "$input_pol" == "REJECT" ]]; then
                 firewall_active=true
             elif [[ "$rule_count" -gt 0 ]]; then
                 # Rules may exist while the default INPUT policy is ACCEPT. Treat this as configured,
@@ -1106,7 +1106,13 @@ audit_network_security_and_tunnels() {
         if [[ -n "$ss_output" ]]; then
             local public_count=0
             local local_count=0
+            local bridge_count=0
             local suspicious_services=()
+
+            # IPs and names of virtual bridge interfaces (libvirt virbr*, docker*, br-*): reachable only from VMs/containers
+            local bridge_ifaces bridge_ips
+            bridge_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^(virbr|docker|br-|lxcbr|podman|cni)')
+            bridge_ips=$(for bi in $bridge_ifaces; do ip -o addr show dev "$bi" 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'; done)
 
             echo -e "  ${CYAN}Active Listening Network Sockets:${NC}"
             
@@ -1133,6 +1139,10 @@ audit_network_security_and_tunnels() {
                     # DHCP client bound to a link-local address: not a reachable service
                     scope="Link-local"
                     ((local_count++))
+                elif { [[ "$addr_part" == *%* ]] && grep -qxF "${addr_part##*%}" <<< "$bridge_ifaces"; } \
+                     || grep -qxF "$(tr -d '[]' <<< "${addr_part%%\%*}")" <<< "$bridge_ips"; then
+                    scope="VM-bridge"
+                    ((bridge_count++))
                 else
                     ((public_count++))
                     case "$port" in
@@ -1155,7 +1165,7 @@ audit_network_security_and_tunnels() {
                 printf "    - %-5s | %-20s | Port %-5s | Scope: %-9s | Process: %s\n" "$netid" "$addr_part" "$port" "$scope" "$proc_name"
             done < <(echo "$ss_output" | awk 'NR>1')
 
-            log_pass "Listening Sockets Audit Summary: ${public_count} public socket(s), ${local_count} localhost-only socket(s)."
+            log_pass "Listening Sockets Audit Summary: ${public_count} public socket(s), ${bridge_count} VM/container-bridge-only socket(s), ${local_count} localhost-only socket(s)."
 
             if [[ ${#suspicious_services[@]} -gt 0 ]]; then
                 local susp_msg
@@ -1212,6 +1222,15 @@ audit_network_security_and_tunnels() {
         for vconf in "${vpn_configs[@]}"; do
             local v_octal
             v_octal=$(run_sudo stat -c "%a" "$vconf" 2>/dev/null)
+            if [[ "$(run_sudo head -c 2 "$vconf" 2>/dev/null)" == "#!" ]]; then
+                # Hook scripts (e.g. openvpn update-resolv-conf) are code, not secrets: need +x, must not be group/world-writable
+                if [[ "$v_octal" =~ ^[0-7][0145][0145]$ && "$v_octal" =~ ^[1357] ]]; then
+                    log_pass "${vconf}: VPN hook script permissions OK (${v_octal})"
+                else
+                    log_warn "${vconf}: VPN hook script has mode ${v_octal} (not executable or writable by others). Expected: 755"
+                fi
+                continue
+            fi
             if [[ "$v_octal" =~ ^(600|400|640)$ ]]; then
                 log_pass "${vconf}: Secure permissions (${v_octal})"
             else
@@ -1392,7 +1411,7 @@ audit_directory_permissions() {
     audit_critical_permissions_matrix
 
     # 2. Temporary Shared Directories Sticky Bit Audit (/tmp, /var/tmp, /dev/shm)
-    echo -e "\n${CYAN}2. Shared Temporary Directories Sticky Bit Check (/tmp, /var/tmp, /dev/shm):${NC}"
+    echo -e "\n${CYAN}4. Shared Temporary Directories Sticky Bit Check (/tmp, /var/tmp, /dev/shm):${NC}"
     local temp_dirs=("/tmp" "/var/tmp" "/dev/shm")
     
     for tdir in "${temp_dirs[@]}"; do
@@ -1408,7 +1427,7 @@ audit_directory_permissions() {
     done
 
     # 3. User Home & Dot-Directories Permissions Audit
-    echo -e "\n${CYAN}3. User Home Directories & Sensitive Dot-Folders Permissions (/home/*, /root):${NC}"
+    echo -e "\n${CYAN}5. User Home Directories & Sensitive Dot-Folders Permissions (/home/*, /root):${NC}"
     local home_issues=0
 
     while IFS=: read -r username password uid gid gecos home shell; do
@@ -1435,7 +1454,7 @@ audit_directory_permissions() {
     fi
 
     # 4. System-wide World-Writable Directories Scan
-    echo -e "\n${CYAN}4. Scanning Filesystem for World-Writable Directories:${NC}"
+    echo -e "\n${CYAN}6. Scanning Filesystem for World-Writable Directories:${NC}"
     echo "Scanning top-level paths for directories writable by 'others' (excluding /tmp, /proc, /sys)..."
     local ww_dirs
     ww_dirs=$(find / -maxdepth 4 -type d \( -perm -0002 -a ! -perm -1000 \) ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null | head -n 15)
@@ -1447,7 +1466,7 @@ audit_directory_permissions() {
     fi
 
     # 5. System Binary Cryptographic Integrity Verification (debsums / rpm)
-    echo -e "\n${CYAN}5. Critical System Binary Integrity Verification:${NC}"
+    echo -e "\n${CYAN}7. Critical System Binary Integrity Verification:${NC}"
     if [[ "${TOOL_FOUND['debsums']}" -eq 1 ]]; then
         echo "Running debsums integrity verification on system packages..."
         # stdout = files whose checksum really differs; stderr = "missing file" notes.
@@ -1484,7 +1503,7 @@ audit_directory_permissions() {
     fi
 
     # 6. Rotated Logs Accumulation & Cleanup Audit (/var/log)
-    echo -e "\n${CYAN}6. Rotated Logs Accumulation & Cleanup (/var/log):${NC}"
+    echo -e "\n${CYAN}8. Rotated Logs Accumulation & Cleanup (/var/log):${NC}"
     local rotated_logs=()
     local rot_bytes=0
 
@@ -1521,7 +1540,7 @@ audit_directory_permissions() {
     fi
 
     # 7. LUKS Cryptographic Keyfiles Audit in Temporary Directories (/tmp, /var/tmp, /dev/shm)
-    echo -e "\n${CYAN}7. Auditing LUKS Cryptographic Keyfiles in Temporary Directories (/tmp, /var/tmp, /dev/shm):${NC}"
+    echo -e "\n${CYAN}9. Auditing LUKS Cryptographic Keyfiles in Temporary Directories (/tmp, /var/tmp, /dev/shm):${NC}"
     local temp_paths=("/tmp" "/var/tmp" "/dev/shm")
     local luks_keys_found=0
 
@@ -1587,7 +1606,7 @@ audit_directory_permissions() {
     fi
 
     # 8. Orphaned Files & Directories Without Owner or Group (-nouser / -nogroup)
-    echo -e "\n${CYAN}8. Orphaned Files & Directories Without Owner or Group Audit (-nouser / -nogroup):${NC}"
+    echo -e "\n${CYAN}10. Orphaned Files & Directories Without Owner or Group Audit (-nouser / -nogroup):${NC}"
     local nouser_list
     nouser_list=$(run_sudo find /etc /var /opt /home /tmp /usr /srv /boot -maxdepth 4 \( -nouser -o -nogroup \) ! -path "/proc*" ! -path "/sys*" ! -path "/dev*" ! -path "/run*" 2>/dev/null | head -n 20)
     if [[ -n "$nouser_list" ]]; then
@@ -1599,7 +1618,7 @@ audit_directory_permissions() {
     fi
 
     # 9. World-Writable Directories & Sticky Bit (+t) Integrity Audit
-    echo -e "\n${CYAN}9. World-Writable Directories & Sticky Bit (+t) Integrity Audit:${NC}"
+    echo -e "\n${CYAN}11. World-Writable Directories & Sticky Bit (+t) Integrity Audit:${NC}"
     local ww_dirs
     ww_dirs=$(run_sudo find /tmp /var /etc /opt /home /usr -xdev -type d -perm -0002 ! -path "/proc*" ! -path "/sys*" ! -path "/run*" 2>/dev/null | sort -u)
     # /dev/shm is a separate tmpfs (-xdev would skip it)
@@ -1644,7 +1663,7 @@ if [[ "${TOOL_FOUND['lynis']}" -eq 1 ]]; then
     run_sudo "${TOOL_BIN['lynis']}" audit system --quick --no-colors 2>/dev/null | grep -E "Hardening index|Warnings|Suggestions"
     if [[ -r /var/log/lynis-report.dat ]]; then
         lynis_warn=$(grep -E '^warning\[\]=' /var/log/lynis-report.dat | cut -d= -f2- | cut -c1-150 | head -n 10)
-        lynis_sugg=$(grep -E '^suggestion\[\]=' /var/log/lynis-report.dat | cut -d= -f2- | cut -c1-150 | head -n 10)
+        lynis_sugg=$(grep -E '^suggestion\[\]=' /var/log/lynis-report.dat | cut -d= -f2- | awk -F'|' '{d=($3!="-" && $3!="")?" ("$3")":""; print $1": "$2 d}' | cut -c1-160 | head -n 10)
         [[ -n "$lynis_warn" ]] && log_warn "Lynis warnings:\n$(echo "$lynis_warn" | sed 's/^/  - /')"
         [[ -n "$lynis_sugg" ]] && echo -e "  Top Lynis suggestions (first 10; full list: /var/log/lynis-report.dat):\n$(echo "$lynis_sugg" | sed 's/^/    - /')"
     fi
@@ -1687,6 +1706,24 @@ audit_user_logins() {
         if [[ -n "$recent_logins" ]]; then
             echo "$recent_logins"
             
+            # 'crash' in last is unreliable (GNOME leaves wtmp records open on clean reboots),
+            # so judge previous boots by whether their journal reached systemd shutdown
+            if [[ "${TOOL_FOUND['journalctl']}" -eq 1 ]]; then
+                local unclean_boots="" b_off
+                for b_off in $(seq -10 -1); do
+                    run_sudo journalctl -b "$b_off" -n 1 -q --no-pager &>/dev/null || continue
+                    if ! run_sudo journalctl -b "$b_off" -n 40 -q --no-pager 2>/dev/null \
+                         | grep -qE 'systemd-shutdown|Journal stopped|Reached target .*(Power-Off|Reboot|Halt|Shutdown)'; then
+                        unclean_boots+="    - boot ${b_off}: $(run_sudo journalctl -b "$b_off" -n 1 -q --no-pager -o short 2>/dev/null | cut -c1-15)\n"
+                    fi
+                done
+                if [[ -n "$unclean_boots" ]]; then
+                    log_warn "Previous boot(s) ended without a clean shutdown (freeze / power loss / kernel panic):\n${unclean_boots}  Inspect: journalctl -b <offset> -e"
+                else
+                    log_pass "Last 10 boots ended with a clean shutdown/reboot."
+                fi
+            fi
+
             local remote_logins
             remote_logins=$(echo "$recent_logins" | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}')
             if [[ -n "$remote_logins" ]]; then
@@ -2545,7 +2582,7 @@ PYEOF
             echo -e "    - PASS_MAX_DAYS : ${CYAN}${def_max:-99999}${NC}"
             echo -e "    - PASS_MIN_DAYS : ${CYAN}${def_min:-0}${NC}"
             echo -e "    - PASS_WARN_AGE : ${CYAN}${def_warn:-7}${NC}"
-            echo -e "    - UMASK         : ${CYAN}${def_umask:-022}${NC}"
+            echo -e "    - UMASK         : ${CYAN}${def_umask:-022 (not set, default)}${NC}"
             echo -e "    - ENCRYPT_METHOD: ${CYAN}${def_enc:-YESCRYPT}${NC}"
 
             if [[ -n "$def_max" && "$def_max" -ge 99999 ]]; then
@@ -2559,7 +2596,6 @@ PYEOF
             fi
 
             local eff_umask="${def_umask:-022}"
-            [[ -z "$def_umask" ]] && log_info "UMASK is not set in /etc/login.defs; the default 022 applies."
             if [[ "$eff_umask" =~ ^0?(022|002|000)$ ]]; then
                 log_warn "Effective default UMASK is ${eff_umask} (new files readable by group/others). Recommended: 027 or 077."
             else
@@ -2656,8 +2692,8 @@ PYEOF
         log_crit "Dangerous env_keep settings (LD_PRELOAD/PATH) in sudoers! Allows arbitrary library injection during sudo execution."
     fi
 
-    # --- 10.7 PAM Authentication Stack Audit ---
-    echo -e "\n${YELLOW}--- 10.7 PAM Authentication Stack Audit (/etc/pam.d/*) ---${NC}"
+    # --- 10.8 PAM Authentication Stack Audit ---
+    echo -e "\n${YELLOW}--- 10.8 PAM Authentication Stack Audit (/etc/pam.d/*) ---${NC}"
     if [[ -d "/etc/pam.d" ]]; then
         local pam_permit pam_exec pam_nonstandard
         pam_permit=$(grep -Ei "^\s*auth\s+sufficient\s+pam_permit\.so" /etc/pam.d/* 2>/dev/null)
@@ -2679,8 +2715,8 @@ PYEOF
             log_crit "UNAUTHORIZED PAM MODULE: PAM configuration loads module from temporary/user directory:\n$pam_nonstandard"
         fi
     fi
-    # --- 10.8 Database Unauthenticated & Passwordless Access Audit ---
-    echo -e "\n${YELLOW}--- 10.8 Database Unauthenticated & Passwordless Access Audit ---${NC}"
+    # --- 10.9 Database Unauthenticated & Passwordless Access Audit ---
+    echo -e "\n${YELLOW}--- 10.9 Database Unauthenticated & Passwordless Access Audit ---${NC}"
     local db_detected=0
     local db_unprotected=0
 
@@ -3260,7 +3296,8 @@ audit_suspicious_processes() {
     echo -e "\n${YELLOW}--- 7. Top CPU & RAM Consuming Processes ---${NC}"
     echo -e "${CYAN}Highest CPU Processes (>70% CPU):${NC}"
     local high_cpu
-    high_cpu=$(ps -eo pid,user,%cpu,%mem,comm --sort=-%cpu | awk 'NR>1 && $3 > 70.0 {print $0}')
+    # ps %cpu is a lifetime average (a just-started 'ps' reports 100%), so sample 1s with top instead
+    high_cpu=$(LC_ALL=C top -b -n 2 -d 1 -w 512 2>/dev/null | awk '/^top -/{frame++} frame==2 && $1 ~ /^[0-9]+$/ && $9+0 > 70.0 && $12 != "top" {printf "  %s %s %s%% CPU %s%% MEM %s\n", $1, $2, $9, $10, $12}')
     if [[ -n "$high_cpu" ]]; then
         log_warn "Processes consuming high CPU (>70%):\n$high_cpu"
     else
@@ -3707,7 +3744,11 @@ audit_grub_bootloader() {
     if [[ "$password_protected" == true ]]; then
         log_pass "GRUB password protection is configured (PBKDF2/password protection active)."
     else
-        log_warn "GRUB bootloader is NOT password protected! Users with physical or console access can modify boot options or gain root shell."
+        if lsblk -no TYPE "$(findmnt -no SOURCE / 2>/dev/null)" -s 2>/dev/null | grep -qx crypt; then
+            log_info "GRUB is not password protected, but / is on LUKS: an edited cmdline (init=/bin/bash) still needs the disk passphrase. Remaining risk: tampering with unencrypted /boot (mitigated by Secure Boot)."
+        else
+            log_warn "GRUB bootloader is NOT password protected! Users with physical or console access can modify boot options or gain root shell."
+        fi
     fi
 
     # 18.3 Recovery Mode & Timeout Audit
@@ -3718,7 +3759,13 @@ audit_grub_bootloader() {
         if [[ "$disable_rec" == "true" || "$disable_rec" == "1" ]]; then
             log_pass "Unauthenticated GRUB recovery mode menu entries are disabled."
         else
-            log_warn "GRUB recovery mode entries are enabled (GRUB_DISABLE_RECOVERY is not 'true'). Booting into recovery mode allows unauthenticated root access."
+            local root_pw_state
+            root_pw_state=$(run_sudo passwd -S root 2>/dev/null | awk '{print $2}')
+            if [[ "$root_pw_state" == "P" ]]; then
+                log_info "GRUB recovery mode entries are enabled, but root has a password: recovery mode asks for it (sulogin). Real bypass is editing the kernel cmdline - see the GRUB password check above."
+            else
+                log_warn "GRUB recovery mode entries are enabled and root has no usable password (${root_pw_state:-unknown}): recovery mode may give a root shell without authentication."
+            fi
         fi
 
         local timeout_val
@@ -3818,7 +3865,11 @@ audit_kernel_hardening() {
         fi
     }
 
-    check_sysctl "net.ipv4.ip_forward" "0"
+    if [[ "$("$sysctl_cmd" -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && ip -o link show 2>/dev/null | grep -qE ': (virbr|docker)[0-9]'; then
+        log_info "net.ipv4.ip_forward=1 - required by libvirt/docker NAT networking (virbr*/docker* present). Fine on a workstation behind a NAT router."
+    else
+        check_sysctl "net.ipv4.ip_forward" "0"
+    fi
     check_sysctl "kernel.kptr_restrict" "1"
     check_sysctl "kernel.dmesg_restrict" "1"
     check_sysctl "fs.protected_symlinks" "1"
@@ -4015,7 +4066,9 @@ audit_dns_hosts() {
         fi
     fi
 
-    local doh_proxies=("cloudflared" "dnscrypt-proxy" "stubby" "adguardhome" "dnsmasq" "unbound")
+    # dnsmasq (e.g. libvirt's) is a plain-text forwarder; unbound counts only with TLS upstreams
+    local doh_proxies=("cloudflared" "dnscrypt-proxy" "stubby" "adguardhome")
+    pgrep -x unbound &>/dev/null && grep -rqsE '^\s*forward-tls-upstream:\s*yes' /etc/unbound/ && doh_proxies+=("unbound")
     local found_doh_daemon=""
     for proxy in "${doh_proxies[@]}"; do
         if pgrep -x "$proxy" &>/dev/null; then
